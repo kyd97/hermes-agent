@@ -12,6 +12,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from agent.skill_analytics import log_skill_event
+
 logger = logging.getLogger(__name__)
 
 _skill_commands: Dict[str, Dict[str, Any]] = {}
@@ -132,6 +134,22 @@ def _build_skill_message(
 
     parts = [activation_note, "", content.strip()]
 
+    workflow = loaded_skill.get("workflow") or {}
+    if isinstance(workflow, dict) and workflow:
+        lines = ["", "[Skill workflow]"]
+        if workflow.get("name"):
+            lines.append(f"Name: {workflow['name']}")
+        for label, key in (
+            ("Steps", "steps"),
+            ("Verification", "verification"),
+            ("Deliverables", "deliverables"),
+        ):
+            values = workflow.get(key)
+            if isinstance(values, list) and values:
+                lines.append(f"{label}:")
+                lines.extend(f"- {item}" for item in values)
+        parts.extend(lines)
+
     # ── Inject resolved skill config values ──
     _inject_skill_config(loaded_skill, parts)
 
@@ -195,6 +213,54 @@ def _build_skill_message(
         parts.append(f"[Runtime note: {runtime_note}]")
 
     return "\n".join(parts)
+
+
+def _expand_skill_payloads(
+    skill_identifiers: list[str],
+    *,
+    task_id: str | None = None,
+) -> tuple[list[tuple[dict[str, Any], Path | None, str, str | None]], list[str], list[str]]:
+    """Resolve skills plus declared related_skills into an operational chain.
+
+    Returns tuples of ``(loaded_skill, skill_dir, skill_name, parent_skill_name)``
+    in load order, along with the loaded names and any missing root identifiers.
+    Related skills are best-effort: missing related skills are skipped instead of
+    being reported as hard failures.
+    """
+    expanded: list[tuple[dict[str, Any], Path | None, str, str | None]] = []
+    loaded_names: list[str] = []
+    missing_roots: list[str] = []
+    seen_identifiers: set[str] = set()
+    seen_skill_names: set[str] = set()
+
+    def _visit(identifier: str, parent_skill_name: str | None = None, *, is_root: bool = False) -> None:
+        normalized_identifier = (identifier or "").strip()
+        if not normalized_identifier or normalized_identifier in seen_identifiers:
+            return
+        seen_identifiers.add(normalized_identifier)
+
+        loaded = _load_skill_payload(normalized_identifier, task_id=task_id)
+        if not loaded:
+            if is_root:
+                missing_roots.append(normalized_identifier)
+            return
+
+        loaded_skill, skill_dir, skill_name = loaded
+        if skill_name in seen_skill_names:
+            return
+        seen_skill_names.add(skill_name)
+        expanded.append((loaded_skill, skill_dir, skill_name, parent_skill_name))
+        loaded_names.append(skill_name)
+
+        related = loaded_skill.get("related_skills") or []
+        if isinstance(related, list):
+            for related_name in related:
+                _visit(str(related_name), skill_name)
+
+    for raw_identifier in skill_identifiers:
+        _visit(raw_identifier, is_root=True)
+
+    return expanded, loaded_names, missing_roots
 
 
 def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
@@ -308,22 +374,49 @@ def build_skill_invocation_message(
     if not skill_info:
         return None
 
-    loaded = _load_skill_payload(skill_info["skill_dir"], task_id=task_id)
-    if not loaded:
+    loaded_payloads, _, _ = _expand_skill_payloads([skill_info["skill_dir"]], task_id=task_id)
+    if not loaded_payloads:
         return f"[Failed to load skill: {skill_info['name']}]"
 
-    loaded_skill, skill_dir, skill_name = loaded
-    activation_note = (
-        f'[SYSTEM: The user has invoked the "{skill_name}" skill, indicating they want '
-        "you to follow its instructions. The full skill content is loaded below.]"
-    )
-    return _build_skill_message(
-        loaded_skill,
-        skill_dir,
-        activation_note,
-        user_instruction=user_instruction,
-        runtime_note=runtime_note,
-    )
+    message_parts: list[str] = []
+    for index, (loaded_skill, skill_dir, skill_name, parent_skill_name) in enumerate(loaded_payloads):
+        if index == 0:
+            activation_note = (
+                f'[SYSTEM: The user has invoked the "{skill_name}" skill, indicating they want '
+                "you to follow its instructions. The full skill content is loaded below.]"
+            )
+            chained_user_instruction = user_instruction
+            log_skill_event(
+                skill_name=skill_name,
+                event_type="invoked",
+                session_id=task_id,
+                trigger="slash_command",
+                metadata={"command": cmd_key, "has_instruction": bool(user_instruction)},
+            )
+        else:
+            activation_note = (
+                f'[SYSTEM: The "{parent_skill_name}" skill declares "{skill_name}" as a related skill. '
+                "Treat the following as additional guidance automatically chained from the related skill graph.]"
+            )
+            chained_user_instruction = ""
+            log_skill_event(
+                skill_name=skill_name,
+                event_type="chained",
+                session_id=task_id,
+                trigger="auto_chain",
+                parent_skill_name=parent_skill_name,
+                metadata={"command": cmd_key},
+            )
+        message_parts.append(
+            _build_skill_message(
+                loaded_skill,
+                skill_dir,
+                activation_note,
+                user_instruction=chained_user_instruction,
+                runtime_note=runtime_note if index == 0 else "",
+            )
+        )
+    return "\n\n".join(message_parts)
 
 
 def build_preloaded_skills_prompt(
@@ -335,27 +428,37 @@ def build_preloaded_skills_prompt(
     Returns (prompt_text, loaded_skill_names, missing_identifiers).
     """
     prompt_parts: list[str] = []
-    loaded_names: list[str] = []
-    missing: list[str] = []
+    expanded_payloads, loaded_names, missing = _expand_skill_payloads(
+        skill_identifiers,
+        task_id=task_id,
+    )
 
-    seen: set[str] = set()
-    for raw_identifier in skill_identifiers:
-        identifier = (raw_identifier or "").strip()
-        if not identifier or identifier in seen:
-            continue
-        seen.add(identifier)
-
-        loaded = _load_skill_payload(identifier, task_id=task_id)
-        if not loaded:
-            missing.append(identifier)
-            continue
-
-        loaded_skill, skill_dir, skill_name = loaded
-        activation_note = (
-            f'[SYSTEM: The user launched this CLI session with the "{skill_name}" skill '
-            "preloaded. Treat its instructions as active guidance for the duration of this "
-            "session unless the user overrides them.]"
-        )
+    for loaded_skill, skill_dir, skill_name, parent_skill_name in expanded_payloads:
+        if parent_skill_name:
+            activation_note = (
+                f'[SYSTEM: The "{parent_skill_name}" skill declares "{skill_name}" as a related skill. '
+                "Treat its instructions as additional guidance automatically chained from the related skill graph.]"
+            )
+            log_skill_event(
+                skill_name=skill_name,
+                event_type="chained",
+                session_id=task_id,
+                trigger="auto_chain",
+                parent_skill_name=parent_skill_name,
+                metadata={"preloaded": True},
+            )
+        else:
+            activation_note = (
+                f'[SYSTEM: The user launched this CLI session with the "{skill_name}" skill '
+                "preloaded. Treat its instructions as active guidance for the duration of this "
+                "session unless the user overrides them.]"
+            )
+            log_skill_event(
+                skill_name=skill_name,
+                event_type="preloaded",
+                session_id=task_id,
+                trigger="preload_flag",
+            )
         prompt_parts.append(
             _build_skill_message(
                 loaded_skill,
@@ -363,6 +466,5 @@ def build_preloaded_skills_prompt(
                 activation_note,
             )
         )
-        loaded_names.append(skill_name)
 
     return "\n\n".join(prompt_parts), loaded_names, missing

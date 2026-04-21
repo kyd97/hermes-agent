@@ -5260,6 +5260,10 @@ Examples:
     skills_audit = skills_subparsers.add_parser("audit", help="Re-scan installed hub skills")
     skills_audit.add_argument("name", nargs="?", help="Specific skill to audit (default: all)")
 
+    skills_stats = skills_subparsers.add_parser("stats", help="Show skill analytics in the terminal")
+    skills_stats.add_argument("name", nargs="?", help="Specific skill to inspect")
+    skills_stats.add_argument("--days", type=int, default=30, help="Number of days to analyze (default: 30)")
+
     skills_uninstall = skills_subparsers.add_parser("uninstall", help="Remove a hub-installed skill")
     skills_uninstall.add_argument("name", help="Skill name to remove")
 
@@ -5733,7 +5737,7 @@ Examples:
     insights_parser = subparsers.add_parser(
         "insights",
         help="Show usage insights and analytics",
-        description="Analyze session history to show token usage, costs, tool patterns, and activity trends"
+        description="Analyze session history to show token usage, costs, tool patterns, skill analytics, and activity trends"
     )
     insights_parser.add_argument("--days", type=int, default=30, help="Number of days to analyze (default: 30)")
     insights_parser.add_argument("--source", help="Filter by platform (cli, telegram, discord, etc.)")
@@ -5742,11 +5746,41 @@ Examples:
         try:
             from hermes_state import SessionDB
             from agent.insights import InsightsEngine
+            from tools.skills_tool import _find_all_skills
 
             db = SessionDB()
             engine = InsightsEngine(db)
             report = engine.generate(days=args.days, source=args.source)
-            print(engine.format_terminal(report))
+            output = engine.format_terminal(report)
+
+            skill_stats = db.get_skill_stats(days=args.days)
+            if skill_stats:
+                inventory = {skill["name"]: skill for skill in _find_all_skills(skip_disabled=True)}
+                output += "\n  🧠 Skill Analytics\n"
+                output += "  " + "─" * 56 + "\n"
+                output += f"  {'Skill':<24} {'Use':>6} {'Views':>6} {'Invoke':>7} {'Last':>6}\n"
+
+                def _last_used_label(ts):
+                    if not ts:
+                        return "never"
+                    delta = max(0, int(_time.time() - ts))
+                    if delta < 3600:
+                        return f"{max(1, delta // 60)}m"
+                    if delta < 86400:
+                        return f"{delta // 3600}h"
+                    return f"{delta // 86400}d"
+
+                for row in skill_stats[:10]:
+                    usage_total = sum(int(row.get(key, 0) or 0) for key in ("views", "invocations", "preloads", "chained", "installs", "updates", "deletes"))
+                    output += (
+                        f"  {row['skill_name'][:24]:<24} {usage_total:>6} {int(row.get('views', 0) or 0):>6} "
+                        f"{int(row.get('invocations', 0) or 0):>7} {_last_used_label(row.get('last_used_at')):>6}\n"
+                    )
+                used = len({row['skill_name'] for row in skill_stats})
+                unused = max(len(inventory) - used, 0)
+                output += f"\n  Used skills: {used}  |  Unused installed skills: {unused}\n"
+
+            print(output)
             db.close()
         except Exception as e:
             print(f"Error generating insights: {e}")

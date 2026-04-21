@@ -586,6 +586,41 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     return skills
 
 
+def _resolve_skill_entry(name: str, all_dirs: List[Path]) -> tuple[Optional[Path], Optional[Path]]:
+    """Resolve a skill by path, directory name, or frontmatter name."""
+    skill_dir = None
+    skill_md = None
+
+    for search_dir in all_dirs:
+        direct_path = search_dir / name
+        if direct_path.is_dir() and (direct_path / "SKILL.md").exists():
+            return direct_path, direct_path / "SKILL.md"
+        if direct_path.with_suffix(".md").exists():
+            return None, direct_path.with_suffix(".md")
+
+    for search_dir in all_dirs:
+        for found_skill_md in search_dir.rglob("SKILL.md"):
+            if any(part in _EXCLUDED_SKILL_DIRS for part in found_skill_md.parts):
+                continue
+            if found_skill_md.parent.name == name:
+                return found_skill_md.parent, found_skill_md
+            try:
+                frontmatter, _ = _parse_frontmatter(
+                    found_skill_md.read_text(encoding="utf-8")[:4000]
+                )
+            except Exception:
+                frontmatter = {}
+            if frontmatter.get("name") == name:
+                return found_skill_md.parent, found_skill_md
+
+    for search_dir in all_dirs:
+        for found_md in search_dir.rglob(f"{name}.md"):
+            if found_md.name != "SKILL.md":
+                return None, found_md
+
+    return skill_dir, skill_md
+
+
 def _load_category_description(category_dir: Path) -> Optional[str]:
     """
     Load category description from DESCRIPTION.md if it exists.
@@ -806,41 +841,7 @@ def skill_view(name: str, file_path: str = None, task_id: str = None) -> str:
                 ensure_ascii=False,
             )
 
-        skill_dir = None
-        skill_md = None
-
-        # Search all dirs: local first, then external (first match wins)
-        for search_dir in all_dirs:
-            # Try direct path first (e.g., "mlops/axolotl")
-            direct_path = search_dir / name
-            if direct_path.is_dir() and (direct_path / "SKILL.md").exists():
-                skill_dir = direct_path
-                skill_md = direct_path / "SKILL.md"
-                break
-            elif direct_path.with_suffix(".md").exists():
-                skill_md = direct_path.with_suffix(".md")
-                break
-
-        # Search by directory name across all dirs
-        if not skill_md:
-            for search_dir in all_dirs:
-                for found_skill_md in search_dir.rglob("SKILL.md"):
-                    if found_skill_md.parent.name == name:
-                        skill_dir = found_skill_md.parent
-                        skill_md = found_skill_md
-                        break
-                if skill_md:
-                    break
-
-        # Legacy: flat .md files
-        if not skill_md:
-            for search_dir in all_dirs:
-                for found_md in search_dir.rglob(f"{name}.md"):
-                    if found_md.name != "SKILL.md":
-                        skill_md = found_md
-                        break
-                if skill_md:
-                    break
+        skill_dir, skill_md = _resolve_skill_entry(name, all_dirs)
 
         if not skill_md or not skill_md.exists():
             available = [s["name"] for s in _find_all_skills()[:20]]
@@ -1026,6 +1027,16 @@ def skill_view(name: str, file_path: str = None, task_id: str = None) -> str:
                     ensure_ascii=False,
                 )
 
+            from agent.skill_analytics import log_skill_event
+
+            log_skill_event(
+                skill_name=resolved_name,
+                event_type="viewed",
+                session_id=task_id,
+                trigger="tool_call",
+                metadata={"file_path": file_path, "file_type": target_file.suffix},
+            )
+
             return json.dumps(
                 {
                     "success": True,
@@ -1093,9 +1104,14 @@ def skill_view(name: str, file_path: str = None, task_id: str = None) -> str:
             hermes_meta = metadata.get("hermes", {}) or {}
 
         tags = _parse_tags(hermes_meta.get("tags") or frontmatter.get("tags", ""))
-        related_skills = _parse_tags(
-            hermes_meta.get("related_skills") or frontmatter.get("related_skills", "")
-        )
+        from agent.skill_utils import extract_related_skills, extract_skill_workflow
+        related_skills = extract_related_skills(frontmatter)
+        workflow = extract_skill_workflow(frontmatter)
+        available_skill_names = {skill["name"] for skill in _find_all_skills()}
+        related_skill_chain = [
+            {"name": related_name, "available": related_name in available_skill_names}
+            for related_name in related_skills
+        ]
 
         # Build linked files structure for clear discovery
         linked_files = {}
@@ -1187,6 +1203,8 @@ def skill_view(name: str, file_path: str = None, task_id: str = None) -> str:
             "description": frontmatter.get("description", ""),
             "tags": tags,
             "related_skills": related_skills,
+            "related_skill_chain": related_skill_chain,
+            "workflow": workflow,
             "content": content,
             "path": rel_path,
             "linked_files": linked_files if linked_files else None,
@@ -1233,6 +1251,16 @@ def skill_view(name: str, file_path: str = None, task_id: str = None) -> str:
             result["compatibility"] = frontmatter["compatibility"]
         if isinstance(metadata, dict):
             result["metadata"] = metadata
+
+        from agent.skill_analytics import log_skill_event
+
+        log_skill_event(
+            skill_name=skill_name,
+            event_type="viewed",
+            session_id=task_id,
+            trigger="tool_call",
+            metadata={"path": rel_path, "linked_files": sorted(linked_files.keys())},
+        )
 
         return json.dumps(result, ensure_ascii=False)
 

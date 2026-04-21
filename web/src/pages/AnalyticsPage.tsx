@@ -6,7 +6,12 @@ import {
   TrendingUp,
 } from "lucide-react";
 import { api } from "@/lib/api";
-import type { AnalyticsResponse, AnalyticsDailyEntry, AnalyticsModelEntry } from "@/lib/api";
+import type {
+  AnalyticsResponse,
+  AnalyticsDailyEntry,
+  AnalyticsModelEntry,
+  SkillAnalyticsResponse,
+} from "@/lib/api";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 
@@ -226,15 +231,18 @@ function ModelTable({ models }: { models: AnalyticsModelEntry[] }) {
 export default function AnalyticsPage() {
   const [days, setDays] = useState(30);
   const [data, setData] = useState<AnalyticsResponse | null>(null);
+  const [skillData, setSkillData] = useState<SkillAnalyticsResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(() => {
     setLoading(true);
     setError(null);
-    api
-      .getAnalytics(days)
-      .then(setData)
+    Promise.all([api.getAnalytics(days), api.getSkillAnalytics(days)])
+      .then(([usage, skills]) => {
+        setData(usage);
+        setSkillData(skills);
+      })
       .catch((err) => setError(String(err)))
       .finally(() => setLoading(false));
   }, [days]);
@@ -305,6 +313,102 @@ export default function AnalyticsPage() {
           {/* Tables */}
           <DailyTable daily={data.daily} />
           <ModelTable models={data.by_model} />
+
+          {skillData && (
+            <>
+              <div className="pt-2">
+                <h2 className="text-base font-semibold mb-3">Skill Analytics</h2>
+                <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+                  <SummaryCard
+                    icon={Cpu}
+                    label="Active Skills"
+                    value={String(skillData.totals.active_skill_count)}
+                    sub={`${skillData.totals.installed_skill_count} installed`}
+                  />
+                  <SummaryCard
+                    icon={BarChart3}
+                    label="Invocations"
+                    value={String(skillData.totals.total_invocations)}
+                    sub={`${skillData.totals.total_preloads} preloads / ${skillData.totals.total_chained} chained`}
+                  />
+                  <SummaryCard
+                    icon={Hash}
+                    label="Views"
+                    value={String(skillData.totals.total_views)}
+                    sub={`${skillData.totals.total_events} total events`}
+                  />
+                  <SummaryCard
+                    icon={TrendingUp}
+                    label="Unused Skills"
+                    value={String(skillData.totals.unused_skill_count)}
+                    sub={`last ${skillData.period_days} days`}
+                  />
+                </div>
+              </div>
+
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-base">Top Skills</CardTitle>
+                </CardHeader>
+                <CardContent>
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-sm">
+                      <thead>
+                        <tr className="border-b border-border text-muted-foreground text-xs">
+                          <th className="text-left py-2 pr-4 font-medium">Skill</th>
+                          <th className="text-left py-2 px-4 font-medium">Category</th>
+                          <th className="text-right py-2 px-4 font-medium">Views</th>
+                          <th className="text-right py-2 px-4 font-medium">Invoke</th>
+                          <th className="text-right py-2 px-4 font-medium">Preload</th>
+                          <th className="text-right py-2 pl-4 font-medium">Sessions</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {skillData.top_skills.slice(0, 10).map((skill) => (
+                          <tr key={skill.skill_name} className="border-b border-border/50 hover:bg-secondary/20 transition-colors">
+                            <td className="py-2 pr-4 font-mono-ui text-xs">{skill.skill_name}</td>
+                            <td className="py-2 px-4 text-muted-foreground">{skill.category || "general"}</td>
+                            <td className="text-right py-2 px-4">{skill.views}</td>
+                            <td className="text-right py-2 px-4">{skill.invocations}</td>
+                            <td className="text-right py-2 px-4">{skill.preloads}</td>
+                            <td className="text-right py-2 pl-4">{skill.unique_sessions}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </CardContent>
+              </Card>
+
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-base">Top Categories</CardTitle>
+                </CardHeader>
+                <CardContent>
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-sm">
+                      <thead>
+                        <tr className="border-b border-border text-muted-foreground text-xs">
+                          <th className="text-left py-2 pr-4 font-medium">Category</th>
+                          <th className="text-right py-2 px-4 font-medium">Events</th>
+                          <th className="text-right py-2 pl-4 font-medium">Skills</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {skillData.top_categories.map((category) => (
+                          <tr key={category.category} className="border-b border-border/50 hover:bg-secondary/20 transition-colors">
+                            <td className="py-2 pr-4">{category.category}</td>
+                            <td className="text-right py-2 px-4">{category.events}</td>
+                            <td className="text-right py-2 pl-4">{category.unique_skills}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </CardContent>
+              </Card>
+            </>
+          )}
         </>
       )}
 

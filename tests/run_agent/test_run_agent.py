@@ -10,6 +10,7 @@ import json
 import logging
 import re
 import uuid
+import tempfile
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from types import SimpleNamespace
@@ -238,9 +239,46 @@ def _mock_response(
     return resp
 
 
-# ===================================================================
-# Group 1: Pure Functions
-# ===================================================================
+class TestEpisodicSummaryPrefetch:
+    def test_run_conversation_injects_relevant_episodic_summary(self):
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = SessionDB(db_path=Path(tmpdir) / "state.db")
+            db.create_session(session_id="old-session", source="cli")
+            db.append_episodic_summary(
+                "old-session",
+                "Earlier we fixed the Redis connection issue by raising the timeout to 30 seconds.",
+            )
+
+            with (
+                patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")),
+                patch("run_agent.check_toolset_requirements", return_value={}),
+                patch("run_agent.OpenAI"),
+            ):
+                agent = AIAgent(
+                    api_key="test-key-1234567890",
+                    quiet_mode=True,
+                    skip_context_files=True,
+                    skip_memory=True,
+                    session_db=db,
+                    session_id="current-session",
+                )
+                agent.client = MagicMock()
+                agent.client.chat.completions.create.return_value = _mock_response(content="done")
+
+                result = agent.run_conversation("Can you revisit the Redis timeout fix?")
+
+                assert result["completed"] is True
+                api_messages = agent.client.chat.completions.create.call_args.kwargs["messages"]
+                joined = json.dumps(api_messages, ensure_ascii=False)
+                assert "Earlier we fixed the Redis connection issue" in joined
+                assert "episodic" in joined.lower()
+
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
 
 
 class TestHasContentAfterThinkBlock:
@@ -830,6 +868,225 @@ class TestToolUseEnforcementConfig:
             a.client = MagicMock()
             prompt = a._build_system_prompt()
             assert TOOL_USE_ENFORCEMENT_GUIDANCE not in prompt
+
+
+class TestMemoryManagerBuiltinIntegration:
+    def test_builtin_provider_registered_when_builtin_memory_enabled(self):
+        with (
+            patch(
+                "run_agent.get_tool_definitions",
+                return_value=_make_tool_defs("web_search", "memory"),
+            ),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={
+                    "memory": {
+                        "memory_enabled": True,
+                        "user_profile_enabled": True,
+                    }
+                },
+            ),
+        ):
+            agent = AIAgent(
+                api_key="test-key-1234567890",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=False,
+            )
+
+        assert agent._memory_manager is not None
+        assert [provider.name for provider in agent._memory_manager.providers] == ["builtin"]
+
+    def test_system_prompt_uses_builtin_provider_block(self):
+        with (
+            patch(
+                "run_agent.get_tool_definitions",
+                return_value=_make_tool_defs("web_search", "memory"),
+            ),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={
+                    "memory": {
+                        "memory_enabled": True,
+                        "user_profile_enabled": True,
+                    }
+                },
+            ),
+        ):
+            agent = AIAgent(
+                api_key="test-key-1234567890",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=False,
+            )
+
+        builtin = agent._memory_manager.get_provider("builtin")
+        builtin._memory_store._system_prompt_snapshot = {
+            "memory": "MEMORY BLOCK",
+            "user": "USER BLOCK",
+        }
+
+        prompt = agent._build_system_prompt()
+        assert "MEMORY BLOCK" in prompt
+        assert "USER BLOCK" in prompt
+
+
+class TestStructuredMemoryMirroring:
+    def test_invoke_tool_mirrors_successful_memory_add_with_class(self, agent_with_memory_tool):
+        agent = agent_with_memory_tool
+        agent._memory_manager = MagicMock()
+
+        with patch(
+            "tools.memory_tool.memory_tool",
+            return_value=json.dumps({"success": True, "entries": ["Prefers terse answers"]}),
+        ):
+            result = agent._invoke_tool(
+                "memory",
+                {
+                    "action": "add",
+                    "target": "user",
+                    "content": "Prefers terse answers",
+                    "memory_class": "preference",
+                },
+                effective_task_id="default",
+            )
+
+        assert json.loads(result)["success"] is True
+        agent._memory_manager.on_memory_write.assert_called_once_with(
+            "add",
+            "user",
+            "Prefers terse answers",
+            entry_class="preference",
+        )
+
+    def test_invoke_tool_skips_mirror_when_builtin_memory_write_fails(self, agent_with_memory_tool):
+        agent = agent_with_memory_tool
+        agent._memory_manager = MagicMock()
+
+        with patch(
+            "tools.memory_tool.memory_tool",
+            return_value=json.dumps({"success": False, "error": "Invalid memory_class"}),
+        ):
+            result = agent._invoke_tool(
+                "memory",
+                {
+                    "action": "add",
+                    "target": "user",
+                    "content": "Prefers terse answers",
+                    "memory_class": "not_valid",
+                },
+                effective_task_id="default",
+            )
+
+        assert json.loads(result)["success"] is False
+        agent._memory_manager.on_memory_write.assert_not_called()
+
+    def test_invoke_tool_mirrors_memory_remove_using_removed_entry_metadata(self, agent_with_memory_tool):
+        agent = agent_with_memory_tool
+        agent._memory_manager = MagicMock()
+
+        with patch(
+            "tools.memory_tool.memory_tool",
+            return_value=json.dumps(
+                {
+                    "success": True,
+                    "removed_content": "Use uv for Python envs",
+                    "removed_entry": {
+                        "content": "Use uv for Python envs",
+                        "memory_class": "tooling",
+                    },
+                    "changed": True,
+                }
+            ),
+        ):
+            result = agent._invoke_tool(
+                "memory",
+                {
+                    "action": "remove",
+                    "target": "memory",
+                    "old_text": "uv",
+                },
+                effective_task_id="default",
+            )
+
+        assert json.loads(result)["success"] is True
+        agent._memory_manager.on_memory_write.assert_called_once_with(
+            "remove",
+            "memory",
+            "Use uv for Python envs",
+            entry_class="tooling",
+        )
+
+    def test_invoke_tool_uses_persisted_entry_for_replace_mirroring(self, agent_with_memory_tool):
+        agent = agent_with_memory_tool
+        agent._memory_manager = MagicMock()
+
+        with patch(
+            "tools.memory_tool.memory_tool",
+            return_value=json.dumps(
+                {
+                    "success": True,
+                    "changed": True,
+                    "entry": {
+                        "content": "Use rye for Python envs",
+                        "memory_class": "tooling",
+                    },
+                }
+            ),
+        ):
+            result = agent._invoke_tool(
+                "memory",
+                {
+                    "action": "replace",
+                    "target": "memory",
+                    "old_text": "uv",
+                    "content": "  Use rye for Python envs  ",
+                },
+                effective_task_id="default",
+            )
+
+        assert json.loads(result)["success"] is True
+        agent._memory_manager.on_memory_write.assert_called_once_with(
+            "replace",
+            "memory",
+            "Use rye for Python envs",
+            entry_class="tooling",
+        )
+
+    def test_invoke_tool_skips_mirror_for_successful_duplicate_add_noop(self, agent_with_memory_tool):
+        agent = agent_with_memory_tool
+        agent._memory_manager = MagicMock()
+
+        with patch(
+            "tools.memory_tool.memory_tool",
+            return_value=json.dumps(
+                {
+                    "success": True,
+                    "changed": False,
+                    "entry": {
+                        "content": "Prefers terse answers",
+                        "memory_class": "preference",
+                    },
+                }
+            ),
+        ):
+            result = agent._invoke_tool(
+                "memory",
+                {
+                    "action": "add",
+                    "target": "user",
+                    "content": "Prefers terse answers",
+                    "memory_class": "preference",
+                },
+                effective_task_id="default",
+            )
+
+        assert json.loads(result)["success"] is True
+        agent._memory_manager.on_memory_write.assert_not_called()
 
 
 class TestInvalidateSystemPrompt:
@@ -1617,6 +1874,72 @@ class TestRunConversation:
             result = agent.run_conversation("hello")
         assert result["final_response"] == "Final answer"
         assert result["completed"] is True
+
+    def test_memory_manager_on_turn_start_fires_before_prefetch(self, agent):
+        self._setup_agent(agent)
+        resp = _mock_response(content="Final answer", finish_reason="stop")
+        agent.client.chat.completions.create.return_value = resp
+        agent._memory_manager = MagicMock()
+        call_order = []
+
+        def _record_turn_start(*args, **kwargs):
+            call_order.append(("turn_start", args, kwargs))
+
+        def _record_prefetch(*args, **kwargs):
+            call_order.append(("prefetch", args, kwargs))
+            return ""
+
+        agent._memory_manager.on_turn_start.side_effect = _record_turn_start
+        agent._memory_manager.prefetch_all.side_effect = _record_prefetch
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["final_response"] == "Final answer"
+        assert [entry[0] for entry in call_order[:2]] == ["turn_start", "prefetch"]
+        _, args, kwargs = call_order[0]
+        assert args == (1, "hello")
+        assert kwargs == {
+            "session_id": agent.session_id,
+            "platform": agent.platform or "cli",
+            "model": agent.model,
+            "tool_count": len(agent.valid_tool_names),
+        }
+
+    def test_memory_manager_on_turn_start_uses_persisted_text_for_multimodal_turns(self, agent):
+        self._setup_agent(agent)
+        resp = _mock_response(content="Final answer", finish_reason="stop")
+        agent.client.chat.completions.create.return_value = resp
+        agent._memory_manager = MagicMock()
+        agent._memory_manager.prefetch_all.return_value = ""
+        multimodal_message = [
+            {"type": "text", "text": "hello"},
+            {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}},
+        ]
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation(
+                multimodal_message,
+                persist_user_message="hello with cat image",
+            )
+
+        assert result["final_response"] == "Final answer"
+        agent._memory_manager.on_turn_start.assert_called_once_with(
+            1,
+            "hello with cat image",
+            session_id=agent.session_id,
+            platform=agent.platform or "cli",
+            model=agent.model,
+            tool_count=len(agent.valid_tool_names),
+        )
 
     def test_tool_calls_then_stop(self, agent):
         self._setup_agent(agent)

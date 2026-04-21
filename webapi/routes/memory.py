@@ -21,6 +21,7 @@ def _read_target(store: MemoryStore, target: str) -> dict:
         return {
             "target": target,
             "entries": store.memory_entries,
+            "structured_entries": [record.to_dict() for record in store.memory_records],
             "usage": store._success_response("memory")["usage"],
             "entry_count": len(store.memory_entries),
         }
@@ -28,6 +29,7 @@ def _read_target(store: MemoryStore, target: str) -> dict:
         return {
             "target": target,
             "entries": store.user_entries,
+            "structured_entries": [record.to_dict() for record in store.user_records],
             "usage": store._success_response("user")["usage"],
             "entry_count": len(store.user_entries),
         }
@@ -54,7 +56,7 @@ async def add_memory(
     payload: MemoryPostRequest,
     store: Annotated[MemoryStore, Depends(reload_memory_store)],
 ) -> MemoryMutationResponse:
-    result = store.add(payload.target, payload.content)
+    result = store.add(payload.target, payload.content, entry_class=payload.memory_class)
     if not result.get("success"):
         raise HTTPException(status_code=400, detail=result.get("error"))
     return MemoryMutationResponse.model_validate(result)
@@ -65,7 +67,7 @@ async def patch_memory(
     payload: MemoryPatchRequest,
     store: Annotated[MemoryStore, Depends(reload_memory_store)],
 ) -> MemoryMutationResponse:
-    result = store.replace(payload.target, payload.old_text, payload.content)
+    result = store.replace(payload.target, payload.old_text, payload.content, entry_class=payload.memory_class)
     if not result.get("success"):
         raise HTTPException(status_code=400, detail=result.get("error"))
     return MemoryMutationResponse.model_validate(result)

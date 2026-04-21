@@ -52,6 +52,7 @@ from gateway.platforms.base import (
     MessageType,
     ProcessingOutcome,
     SendResult,
+    build_attachment_record,
     cache_image_from_url,
     cache_audio_from_url,
     cache_document_from_bytes,
@@ -2369,6 +2370,7 @@ class DiscordAdapter(BasePlatformAdapter):
         # vision tool can access them reliably (Discord CDN URLs can expire).
         media_urls = []
         media_types = []
+        attachments = []
         pending_text_injection: Optional[str] = None
         for att in message.attachments:
             content_type = att.content_type or "unknown"
@@ -2381,12 +2383,32 @@ class DiscordAdapter(BasePlatformAdapter):
                     cached_path = await cache_image_from_url(att.url, ext=ext)
                     media_urls.append(cached_path)
                     media_types.append(content_type)
+                    attachments.append(
+                        build_attachment_record(
+                            cached_path,
+                            content_type,
+                            filename=att.filename,
+                            message_type=MessageType.PHOTO,
+                            source_url=att.url,
+                            size_bytes=getattr(att, "size", None),
+                        )
+                    )
                     print(f"[Discord] Cached user image: {cached_path}", flush=True)
                 except Exception as e:
                     print(f"[Discord] Failed to cache image attachment: {e}", flush=True)
                     # Fall back to the CDN URL if caching fails
                     media_urls.append(att.url)
                     media_types.append(content_type)
+                    attachments.append(
+                        build_attachment_record(
+                            att.url,
+                            content_type,
+                            filename=att.filename,
+                            message_type=MessageType.PHOTO,
+                            source_url=att.url,
+                            size_bytes=getattr(att, "size", None),
+                        )
+                    )
             elif content_type.startswith("audio/"):
                 try:
                     ext = "." + content_type.split("/")[-1].split(";")[0]
@@ -2395,11 +2417,31 @@ class DiscordAdapter(BasePlatformAdapter):
                     cached_path = await cache_audio_from_url(att.url, ext=ext)
                     media_urls.append(cached_path)
                     media_types.append(content_type)
+                    attachments.append(
+                        build_attachment_record(
+                            cached_path,
+                            content_type,
+                            filename=att.filename,
+                            message_type=MessageType.AUDIO,
+                            source_url=att.url,
+                            size_bytes=getattr(att, "size", None),
+                        )
+                    )
                     print(f"[Discord] Cached user audio: {cached_path}", flush=True)
                 except Exception as e:
                     print(f"[Discord] Failed to cache audio attachment: {e}", flush=True)
                     media_urls.append(att.url)
                     media_types.append(content_type)
+                    attachments.append(
+                        build_attachment_record(
+                            att.url,
+                            content_type,
+                            filename=att.filename,
+                            message_type=MessageType.AUDIO,
+                            source_url=att.url,
+                            size_bytes=getattr(att, "size", None),
+                        )
+                    )
             else:
                 # Document attachments: download, cache, and optionally inject text
                 ext = ""
@@ -2442,6 +2484,16 @@ class DiscordAdapter(BasePlatformAdapter):
                             doc_mime = SUPPORTED_DOCUMENT_TYPES[ext]
                             media_urls.append(cached_path)
                             media_types.append(doc_mime)
+                            attachments.append(
+                                build_attachment_record(
+                                    cached_path,
+                                    doc_mime,
+                                    filename=att.filename or f"document{ext}",
+                                    message_type=MessageType.DOCUMENT,
+                                    source_url=att.url,
+                                    size_bytes=att.size,
+                                )
+                            )
                             logger.info("[Discord] Cached user document: %s", cached_path)
                             # Inject text content for plain-text documents (capped at 100 KB)
                             MAX_TEXT_INJECT_BYTES = 100 * 1024
@@ -2484,6 +2536,7 @@ class DiscordAdapter(BasePlatformAdapter):
             message_id=str(message.id),
             media_urls=media_urls,
             media_types=media_types,
+            attachments=attachments,
             reply_to_message_id=str(message.reference.message_id) if message.reference else None,
             timestamp=message.created_at,
             auto_skill=_skills,
@@ -2534,6 +2587,7 @@ class DiscordAdapter(BasePlatformAdapter):
             if event.media_urls:
                 existing.media_urls.extend(event.media_urls)
                 existing.media_types.extend(event.media_types)
+                existing.attachments.extend(event.attachments)
 
         prior_task = self._pending_text_batch_tasks.get(key)
         if prior_task and not prior_task.done():

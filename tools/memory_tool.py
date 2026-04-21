@@ -30,6 +30,7 @@ import os
 import re
 import tempfile
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Dict, Any, List, Optional
@@ -50,6 +51,46 @@ def get_memory_dir() -> Path:
 MEMORY_DIR = get_memory_dir()
 
 ENTRY_DELIMITER = "\n§\n"
+DEFAULT_MEMORY_CLASS = "other"
+MEMORY_CLASSES_BY_TARGET = {
+    "memory": {"environment", "tooling", "workflow", "project", "convention", "correction", DEFAULT_MEMORY_CLASS},
+    "user": {"identity", "preference", "profile", "communication", "workflow", DEFAULT_MEMORY_CLASS},
+}
+_SERIALIZED_CLASS_PREFIX_RE = re.compile(r"^\[memory_class=([a-z_]+)\]\n(.*)\Z", re.DOTALL)
+
+
+@dataclass(frozen=True)
+class MemoryRecord:
+    content: str
+    memory_class: str = DEFAULT_MEMORY_CLASS
+
+    def to_dict(self) -> Dict[str, str]:
+        return {"content": self.content, "memory_class": self.memory_class}
+
+
+def _normalize_memory_class(target: str, entry_class: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    normalized = str(entry_class or DEFAULT_MEMORY_CLASS).strip().lower() or DEFAULT_MEMORY_CLASS
+    valid = MEMORY_CLASSES_BY_TARGET.get(target)
+    if not valid:
+        return None, f"Invalid target '{target}'."
+    if normalized not in valid:
+        choices = ", ".join(sorted(valid))
+        return None, f"Invalid memory_class '{normalized}' for target '{target}'. Valid classes: {choices}."
+    return normalized, None
+
+
+def _serialize_record(record: MemoryRecord) -> str:
+    if record.memory_class == DEFAULT_MEMORY_CLASS:
+        return record.content
+    return f"[memory_class={record.memory_class}]\n{record.content}"
+
+
+def _deserialize_record(raw_entry: str) -> MemoryRecord:
+    text = raw_entry.strip()
+    match = _SERIALIZED_CLASS_PREFIX_RE.match(text)
+    if not match:
+        return MemoryRecord(content=text, memory_class=DEFAULT_MEMORY_CLASS)
+    return MemoryRecord(content=match.group(2).strip(), memory_class=match.group(1).strip().lower() or DEFAULT_MEMORY_CLASS)
 
 
 # ---------------------------------------------------------------------------
@@ -109,24 +150,36 @@ class MemoryStore:
     """
 
     def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375):
-        self.memory_entries: List[str] = []
-        self.user_entries: List[str] = []
+        self._memory_records: List[MemoryRecord] = []
+        self._user_records: List[MemoryRecord] = []
         self.memory_char_limit = memory_char_limit
         self.user_char_limit = user_char_limit
         # Frozen snapshot for system prompt -- set once at load_from_disk()
         self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": ""}
+
+    @property
+    def memory_entries(self) -> List[str]:
+        return [record.content for record in self._memory_records]
+
+    @property
+    def user_entries(self) -> List[str]:
+        return [record.content for record in self._user_records]
+
+    @property
+    def memory_records(self) -> List[MemoryRecord]:
+        return list(self._memory_records)
+
+    @property
+    def user_records(self) -> List[MemoryRecord]:
+        return list(self._user_records)
 
     def load_from_disk(self):
         """Load entries from MEMORY.md and USER.md, capture system prompt snapshot."""
         mem_dir = get_memory_dir()
         mem_dir.mkdir(parents=True, exist_ok=True)
 
-        self.memory_entries = self._read_file(mem_dir / "MEMORY.md")
-        self.user_entries = self._read_file(mem_dir / "USER.md")
-
-        # Deduplicate entries (preserves order, keeps first occurrence)
-        self.memory_entries = list(dict.fromkeys(self.memory_entries))
-        self.user_entries = list(dict.fromkeys(self.user_entries))
+        self._memory_records = self._dedupe_records(self._read_records(mem_dir / "MEMORY.md"))
+        self._user_records = self._dedupe_records(self._read_records(mem_dir / "USER.md"))
 
         # Capture frozen snapshot for system prompt injection
         self._system_prompt_snapshot = {
@@ -164,25 +217,30 @@ class MemoryStore:
 
         Called under file lock to get the latest state before mutating.
         """
-        fresh = self._read_file(self._path_for(target))
-        fresh = list(dict.fromkeys(fresh))  # deduplicate
-        self._set_entries(target, fresh)
+        fresh = self._dedupe_records(self._read_records(self._path_for(target)))
+        self._set_records(target, fresh)
 
     def save_to_disk(self, target: str):
         """Persist entries to the appropriate file. Called after every mutation."""
         get_memory_dir().mkdir(parents=True, exist_ok=True)
-        self._write_file(self._path_for(target), self._entries_for(target))
+        self._write_records(self._path_for(target), self._records_for(target))
+
+    def _records_for(self, target: str) -> List[MemoryRecord]:
+        if target == "user":
+            return list(self._user_records)
+        return list(self._memory_records)
+
+    def _set_records(self, target: str, records: List[MemoryRecord]):
+        if target == "user":
+            self._user_records = list(records)
+        else:
+            self._memory_records = list(records)
 
     def _entries_for(self, target: str) -> List[str]:
-        if target == "user":
-            return self.user_entries
-        return self.memory_entries
+        return [record.content for record in self._records_for(target)]
 
-    def _set_entries(self, target: str, entries: List[str]):
-        if target == "user":
-            self.user_entries = entries
-        else:
-            self.memory_entries = entries
+    def _structured_entries_for(self, target: str) -> List[Dict[str, str]]:
+        return [record.to_dict() for record in self._records_for(target)]
 
     def _char_count(self, target: str) -> int:
         entries = self._entries_for(target)
@@ -195,11 +253,27 @@ class MemoryStore:
             return self.user_char_limit
         return self.memory_char_limit
 
-    def add(self, target: str, content: str) -> Dict[str, Any]:
+    @staticmethod
+    def _dedupe_records(records: List[MemoryRecord]) -> List[MemoryRecord]:
+        seen = set()
+        deduped: List[MemoryRecord] = []
+        for record in records:
+            key = (record.content, record.memory_class)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(record)
+        return deduped
+
+    def add(self, target: str, content: str, entry_class: Optional[str] = None) -> Dict[str, Any]:
         """Append a new entry. Returns error if it would exceed the char limit."""
         content = content.strip()
         if not content:
             return {"success": False, "error": "Content cannot be empty."}
+
+        normalized_class, class_error = _normalize_memory_class(target, entry_class)
+        if class_error:
+            return {"success": False, "error": class_error}
 
         # Scan for injection/exfiltration before accepting
         scan_error = _scan_memory_content(content)
@@ -210,12 +284,18 @@ class MemoryStore:
             # Re-read from disk under lock to pick up writes from other sessions
             self._reload_target(target)
 
-            entries = self._entries_for(target)
+            records = self._records_for(target)
+            entries = [record.content for record in records]
             limit = self._char_limit(target)
 
             # Reject exact duplicates
             if content in entries:
-                return self._success_response(target, "Entry already exists (no duplicate added).")
+                result = self._success_response(target, "Entry already exists (no duplicate added).")
+                duplicate_record = next((record for record in records if record.content == content), None)
+                if duplicate_record is not None:
+                    result["entry"] = duplicate_record.to_dict()
+                result["changed"] = False
+                return result
 
             # Calculate what the new total would be
             new_entries = entries + [content]
@@ -234,13 +314,16 @@ class MemoryStore:
                     "usage": f"{current:,}/{limit:,}",
                 }
 
-            entries.append(content)
-            self._set_entries(target, entries)
+            records.append(MemoryRecord(content=content, memory_class=normalized_class or DEFAULT_MEMORY_CLASS))
+            self._set_records(target, records)
             self.save_to_disk(target)
 
-        return self._success_response(target, "Entry added.")
+        result = self._success_response(target, "Entry added.")
+        result["entry"] = records[-1].to_dict()
+        result["changed"] = True
+        return result
 
-    def replace(self, target: str, old_text: str, new_content: str) -> Dict[str, Any]:
+    def replace(self, target: str, old_text: str, new_content: str, entry_class: Optional[str] = None) -> Dict[str, Any]:
         """Find entry containing old_text substring, replace it with new_content."""
         old_text = old_text.strip()
         new_content = new_content.strip()
@@ -248,6 +331,12 @@ class MemoryStore:
             return {"success": False, "error": "old_text cannot be empty."}
         if not new_content:
             return {"success": False, "error": "new_content cannot be empty. Use 'remove' to delete entries."}
+
+        normalized_class = None
+        if entry_class is not None:
+            normalized_class, class_error = _normalize_memory_class(target, entry_class)
+            if class_error:
+                return {"success": False, "error": class_error}
 
         # Scan replacement content for injection/exfiltration
         scan_error = _scan_memory_content(new_content)
@@ -257,14 +346,17 @@ class MemoryStore:
         with self._file_lock(self._path_for(target)):
             self._reload_target(target)
 
-            entries = self._entries_for(target)
+            records = self._records_for(target)
+            entries = [record.content for record in records]
             matches = [(i, e) for i, e in enumerate(entries) if old_text in e]
 
             if not matches:
                 return {"success": False, "error": f"No entry matched '{old_text}'."}
 
             if len(matches) > 1:
-                # If all matches are identical (exact duplicates), operate on the first one
+                # If all matches are identical, only auto-resolve when their
+                # structured classes are also identical. Same content with
+                # different classes is ambiguous in the structured model.
                 unique_texts = set(e for _, e in matches)
                 if len(unique_texts) > 1:
                     previews = [e[:80] + ("..." if len(e) > 80 else "") for _, e in matches]
@@ -273,7 +365,17 @@ class MemoryStore:
                         "error": f"Multiple entries matched '{old_text}'. Be more specific.",
                         "matches": previews,
                     }
-                # All identical -- safe to replace just the first
+                unique_classes = {records[i].memory_class for i, _ in matches}
+                if len(unique_classes) > 1:
+                    return {
+                        "success": False,
+                        "error": (
+                            f"Multiple structured entries matched '{old_text}' with different classes. "
+                            "Be more specific."
+                        ),
+                        "matches": [records[i].to_dict() for i, _ in matches],
+                    }
+                # All identical text/class duplicates -- safe to replace just the first
 
             idx = matches[0][0]
             limit = self._char_limit(target)
@@ -292,11 +394,18 @@ class MemoryStore:
                     ),
                 }
 
-            entries[idx] = new_content
-            self._set_entries(target, entries)
+            current_class = records[idx].memory_class
+            records[idx] = MemoryRecord(
+                content=new_content,
+                memory_class=normalized_class or current_class,
+            )
+            self._set_records(target, records)
             self.save_to_disk(target)
 
-        return self._success_response(target, "Entry replaced.")
+        result = self._success_response(target, "Entry replaced.")
+        result["entry"] = records[idx].to_dict()
+        result["changed"] = True
+        return result
 
     def remove(self, target: str, old_text: str) -> Dict[str, Any]:
         """Remove the entry containing old_text substring."""
@@ -307,14 +416,17 @@ class MemoryStore:
         with self._file_lock(self._path_for(target)):
             self._reload_target(target)
 
-            entries = self._entries_for(target)
+            records = self._records_for(target)
+            entries = [record.content for record in records]
             matches = [(i, e) for i, e in enumerate(entries) if old_text in e]
 
             if not matches:
                 return {"success": False, "error": f"No entry matched '{old_text}'."}
 
             if len(matches) > 1:
-                # If all matches are identical (exact duplicates), remove the first one
+                # If all matches are identical, only auto-resolve when their
+                # structured classes are also identical. Same content with
+                # different classes is ambiguous in the structured model.
                 unique_texts = set(e for _, e in matches)
                 if len(unique_texts) > 1:
                     previews = [e[:80] + ("..." if len(e) > 80 else "") for _, e in matches]
@@ -323,14 +435,29 @@ class MemoryStore:
                         "error": f"Multiple entries matched '{old_text}'. Be more specific.",
                         "matches": previews,
                     }
-                # All identical -- safe to remove just the first
+                unique_classes = {records[i].memory_class for i, _ in matches}
+                if len(unique_classes) > 1:
+                    return {
+                        "success": False,
+                        "error": (
+                            f"Multiple structured entries matched '{old_text}' with different classes. "
+                            "Be more specific."
+                        ),
+                        "matches": [records[i].to_dict() for i, _ in matches],
+                    }
+                # All identical text/class duplicates -- safe to remove just the first
 
             idx = matches[0][0]
-            entries.pop(idx)
-            self._set_entries(target, entries)
+            records = self._records_for(target)
+            removed_record = records.pop(idx)
+            self._set_records(target, records)
             self.save_to_disk(target)
 
-        return self._success_response(target, "Entry removed.")
+        result = self._success_response(target, "Entry removed.")
+        result["removed_content"] = removed_record.content
+        result["removed_entry"] = removed_record.to_dict()
+        result["changed"] = True
+        return result
 
     def format_for_system_prompt(self, target: str) -> Optional[str]:
         """
@@ -357,6 +484,7 @@ class MemoryStore:
             "success": True,
             "target": target,
             "entries": entries,
+            "structured_entries": self._structured_entries_for(target),
             "usage": f"{pct}% — {current:,}/{limit:,} chars",
             "entry_count": len(entries),
         }
@@ -383,10 +511,10 @@ class MemoryStore:
         return f"{separator}\n{header}\n{separator}\n{content}"
 
     @staticmethod
-    def _read_file(path: Path) -> List[str]:
-        """Read a memory file and split into entries.
+    def _read_records(path: Path) -> List[MemoryRecord]:
+        """Read a memory file and split into structured records.
 
-        No file locking needed: _write_file uses atomic rename, so readers
+        No file locking needed: _write_records uses atomic rename, so readers
         always see either the previous complete file or the new complete file.
         """
         if not path.exists():
@@ -399,21 +527,19 @@ class MemoryStore:
         if not raw.strip():
             return []
 
-        # Use ENTRY_DELIMITER for consistency with _write_file. Splitting by "§"
-        # alone would incorrectly split entries that contain "§" in their content.
         entries = [e.strip() for e in raw.split(ENTRY_DELIMITER)]
-        return [e for e in entries if e]
+        return [_deserialize_record(e) for e in entries if e]
 
     @staticmethod
-    def _write_file(path: Path, entries: List[str]):
-        """Write entries to a memory file using atomic temp-file + rename.
+    def _write_records(path: Path, records: List[MemoryRecord]):
+        """Write structured records to a memory file using atomic temp-file + rename.
 
         Previous implementation used open("w") + flock, but "w" truncates the
         file *before* the lock is acquired, creating a race window where
         concurrent readers see an empty file. Atomic rename avoids this:
         readers always see either the old complete file or the new one.
         """
-        content = ENTRY_DELIMITER.join(entries) if entries else ""
+        content = ENTRY_DELIMITER.join(_serialize_record(record) for record in records) if records else ""
         try:
             # Write to temp file in same directory (same filesystem for atomic rename)
             fd, tmp_path = tempfile.mkstemp(
@@ -436,11 +562,17 @@ class MemoryStore:
             raise RuntimeError(f"Failed to write memory file {path}: {e}")
 
 
+# Backwards-compatible aliases for older callers/tests.
+MemoryStore._read_file = staticmethod(lambda path: [record.content for record in MemoryStore._read_records(path)])
+MemoryStore._write_file = staticmethod(lambda path, entries: MemoryStore._write_records(path, [MemoryRecord(content=entry) for entry in entries]))
+
+
 def memory_tool(
     action: str,
     target: str = "memory",
     content: str = None,
     old_text: str = None,
+    memory_class: Optional[str] = None,
     store: Optional[MemoryStore] = None,
 ) -> str:
     """
@@ -457,14 +589,14 @@ def memory_tool(
     if action == "add":
         if not content:
             return tool_error("Content is required for 'add' action.", success=False)
-        result = store.add(target, content)
+        result = store.add(target, content, entry_class=memory_class)
 
     elif action == "replace":
         if not old_text:
             return tool_error("old_text is required for 'replace' action.", success=False)
         if not content:
             return tool_error("content is required for 'replace' action.", success=False)
-        result = store.replace(target, old_text, content)
+        result = store.replace(target, old_text, content, entry_class=memory_class)
 
     elif action == "remove":
         if not old_text:
@@ -528,6 +660,10 @@ MEMORY_SCHEMA = {
                 "type": "string",
                 "description": "The entry content. Required for 'add' and 'replace'."
             },
+            "memory_class": {
+                "type": "string",
+                "description": "Optional structured class for the entry. Use classes like preference/identity/profile/communication for target='user', and environment/tooling/workflow/project/convention/correction for target='memory'. Defaults to 'other'."
+            },
             "old_text": {
                 "type": "string",
                 "description": "Short unique substring identifying the entry to replace or remove."
@@ -550,6 +686,7 @@ registry.register(
         target=args.get("target", "memory"),
         content=args.get("content"),
         old_text=args.get("old_text"),
+        memory_class=args.get("memory_class"),
         store=kw.get("store")),
     check_fn=check_memory_requirements,
     emoji="🧠",

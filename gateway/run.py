@@ -3011,45 +3011,26 @@ class GatewayRunner:
                             pass
 
         if event.media_urls and event.message_type == MessageType.DOCUMENT:
+            document_paths = []
+            document_types = []
             import mimetypes as _mimetypes
 
-            _TEXT_EXTENSIONS = {".txt", ".md", ".csv", ".log", ".json", ".xml", ".yaml", ".yml", ".toml", ".ini", ".cfg"}
             for i, path in enumerate(event.media_urls):
                 mtype = event.media_types[i] if i < len(event.media_types) else ""
                 if mtype in ("", "application/octet-stream"):
-                    import os as _os2
+                    guessed, _ = _mimetypes.guess_type(path)
+                    if guessed:
+                        mtype = guessed
+                if mtype.startswith(("application/", "text/")):
+                    document_paths.append(path)
+                    document_types.append(mtype)
 
-                    _ext = _os2.path.splitext(path)[1].lower()
-                    if _ext in _TEXT_EXTENSIONS:
-                        mtype = "text/plain"
-                    else:
-                        guessed, _ = _mimetypes.guess_type(path)
-                        if guessed:
-                            mtype = guessed
-                if not mtype.startswith(("application/", "text/")):
-                    continue
-
-                import os as _os
-                import re as _re
-
-                basename = _os.path.basename(path)
-                parts = basename.split("_", 2)
-                display_name = parts[2] if len(parts) >= 3 else basename
-                display_name = _re.sub(r'[^\w.\- ]', '_', display_name)
-
-                if mtype.startswith("text/"):
-                    context_note = (
-                        f"[The user sent a text document: '{display_name}'. "
-                        f"Its content has been included below. "
-                        f"The file is also saved at: {path}]"
-                    )
-                else:
-                    context_note = (
-                        f"[The user sent a document: '{display_name}'. "
-                        f"The file is saved at: {path}. "
-                        f"Ask the user what they'd like you to do with it.]"
-                    )
-                message_text = f"{context_note}\n\n{message_text}"
+            if document_paths:
+                message_text = await self._enrich_message_with_document_ingest(
+                    message_text,
+                    document_paths,
+                    document_types,
+                )
 
         if getattr(event, "reply_to_text", None) and event.reply_to_message_id:
             reply_snippet = event.reply_to_text[:500]
@@ -4077,6 +4058,8 @@ class GatewayRunner:
 
     async def _handle_status_command(self, event: MessageEvent) -> str:
         """Handle /status command."""
+        from agent.status_surface import build_status_surface
+
         source = event.source
         session_entry = self.session_store.get_or_create_session(source)
 
@@ -4084,7 +4067,8 @@ class GatewayRunner:
 
         # Check if there's an active agent
         session_key = session_entry.session_key
-        is_running = session_key in self._running_agents
+        running_agent = self._running_agents.get(session_key)
+        is_running = running_agent is not None
 
         title = None
         if self._session_db:
@@ -4092,6 +4076,20 @@ class GatewayRunner:
                 title = self._session_db.get_session_title(session_entry.session_id)
             except Exception:
                 title = None
+
+        history = []
+        try:
+            history = self.session_store.load_transcript(session_key) or []
+        except Exception:
+            history = []
+
+        status_surface = build_status_surface(
+            agent=running_agent if is_running else None,
+            history=history,
+            session_id=session_entry.session_id,
+            session_title=title,
+            agent_running=is_running,
+        )
 
         lines = [
             "📊 **Hermes Gateway Status**",
@@ -4108,6 +4106,31 @@ class GatewayRunner:
             "",
             f"**Connected Platforms:** {', '.join(connected_platforms)}",
         ])
+
+        activity = status_surface.get("activity") or {}
+        if activity:
+            if activity.get("current_tool"):
+                lines.append(f"**Current Tool:** `{activity['current_tool']}`")
+            if activity.get("api_call_count") is not None:
+                lines.append(f"**API Calls:** {activity.get('api_call_count', 0)}")
+
+        todo_summary = (status_surface.get("todos") or {}).get("summary") or {}
+        todo_items = (status_surface.get("todos") or {}).get("items") or []
+        lines.append(
+            f"**Todo:** {todo_summary.get('total', 0)} total · {todo_summary.get('in_progress', 0)} in progress · {todo_summary.get('pending', 0)} pending"
+        )
+        for item in todo_items[:3]:
+            lines.append(f"- `{item.get('id')}` {item.get('content')} ({item.get('status')})")
+
+        delegation_summary = (status_surface.get("delegation") or {}).get("summary") or {}
+        lines.append(
+            f"**Delegations:** {delegation_summary.get('total', 0)} total · {delegation_summary.get('completed', 0)} completed"
+        )
+
+        cron_summary = (status_surface.get("cron") or {}).get("summary") or {}
+        lines.append(
+            f"**Cron Jobs:** {cron_summary.get('total', 0)} total · {cron_summary.get('enabled', 0)} enabled · {cron_summary.get('paused', 0)} paused"
+        )
 
         return "\n".join(lines)
     
@@ -7056,6 +7079,70 @@ class GatewayRunner:
                 )
 
         # Combine: vision descriptions first, then the user's original text
+        if enriched_parts:
+            prefix = "\n\n".join(enriched_parts)
+            if user_text:
+                return f"{prefix}\n\n{user_text}"
+            return prefix
+        return user_text
+
+    async def _enrich_message_with_document_ingest(
+        self,
+        user_text: str,
+        document_paths: List[str],
+        document_types: List[str],
+    ) -> str:
+        """Best-effort ingest for document attachments.
+
+        Converts supported documents into a concise summary plus extracted text
+        snippet so the agent can reason about the attachment immediately.
+        Falls back to a simple path note when extraction is unavailable.
+        """
+        from tools.document_ingest import ingest_document
+        import asyncio
+        import mimetypes as _mimetypes
+        import os as _os
+        import re as _re
+
+        enriched_parts = []
+        for i, path in enumerate(document_paths):
+            mtype = document_types[i] if i < len(document_types) else ""
+            if mtype in ("", "application/octet-stream"):
+                guessed, _ = _mimetypes.guess_type(path)
+                if guessed:
+                    mtype = guessed
+
+            basename = _os.path.basename(path)
+            parts = basename.split("_", 2)
+            display_name = parts[2] if len(parts) >= 3 else basename
+            display_name = _re.sub(r'[^\w.\- ]', '_', display_name)
+
+            result = await asyncio.to_thread(ingest_document, path)
+            if result.get("success"):
+                summary = result.get("summary", "")
+                extracted_text = result.get("extracted_text", "")
+                note = (
+                    f"[The user sent a document: '{display_name}'. "
+                    f"Document summary: {summary} "
+                    f"Saved at: {path}]"
+                )
+                if extracted_text:
+                    note += f"\n[Extracted content:\n{extracted_text}]"
+                enriched_parts.append(note)
+                continue
+
+            if mtype.startswith("text/"):
+                fallback_note = (
+                    f"[The user sent a text document: '{display_name}'. "
+                    f"The file is saved at: {path}. Ask the user what they'd like you to do with it.]"
+                )
+            else:
+                fallback_note = (
+                    f"[The user sent a document: '{display_name}'. "
+                    f"The file is saved at: {path}. Ask the user what they'd like you to do with it.]"
+                )
+            enriched_parts.append(fallback_note)
+
         if enriched_parts:
             prefix = "\n\n".join(enriched_parts)
             if user_text:

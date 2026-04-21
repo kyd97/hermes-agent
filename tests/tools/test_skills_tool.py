@@ -338,6 +338,21 @@ class TestSkillView:
         assert result["success"] is True
         assert "Endpoint info" in result["content"]
 
+    def test_view_logs_skill_event(self, tmp_path, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            "agent.skill_analytics.log_skill_event",
+            lambda **kwargs: calls.append(kwargs),
+        )
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "my-skill")
+            raw = skill_view("my-skill", task_id="sess-3")
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert calls[0]["skill_name"] == "my-skill"
+        assert calls[0]["event_type"] == "viewed"
+        assert calls[0]["session_id"] == "sess-3"
+
     def test_view_nonexistent_file(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             _make_skill(tmp_path, "my-skill")
@@ -367,6 +382,76 @@ class TestSkillView:
         result = json.loads(raw)
         assert "fine-tuning" in result["tags"]
         assert "llm" in result["tags"]
+
+    def test_view_exposes_workflow_metadata(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path,
+                "workflowed",
+                frontmatter_extra=(
+                    "metadata:\n"
+                    "  hermes:\n"
+                    "    workflow:\n"
+                    "      name: bugfix\n"
+                    "      steps:\n"
+                    "        - reproduce\n"
+                    "        - write regression test\n"
+                    "        - patch\n"
+                    "      verification:\n"
+                    "        - run targeted tests\n"
+                    "      deliverables:\n"
+                    "        - bugfix patch\n"
+                ),
+            )
+            raw = skill_view("workflowed")
+        result = json.loads(raw)
+        assert result["workflow"]["name"] == "bugfix"
+        assert result["workflow"]["steps"] == ["reproduce", "write regression test", "patch"]
+        assert result["workflow"]["verification"] == ["run targeted tests"]
+        assert result["workflow"]["deliverables"] == ["bugfix patch"]
+
+    def test_view_exposes_related_skill_chain_status(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "child-skill")
+            _make_skill(
+                tmp_path,
+                "parent-skill",
+                frontmatter_extra=(
+                    "metadata:\n"
+                    "  hermes:\n"
+                    "    related_skills: [child-skill, missing-skill]\n"
+                ),
+            )
+            raw = skill_view("parent-skill")
+        result = json.loads(raw)
+        assert result["related_skills"] == ["child-skill", "missing-skill"]
+        assert result["related_skill_chain"] == [
+            {"name": "child-skill", "available": True},
+            {"name": "missing-skill", "available": False},
+        ]
+
+    def test_view_resolves_skill_by_frontmatter_name(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            skill_dir = tmp_path / "child-dir"
+            skill_dir.mkdir(parents=True, exist_ok=True)
+            (skill_dir / "SKILL.md").write_text(
+                "---\nname: child-canonical\ndescription: canonical child\n---\n\nBody.\n"
+            )
+            raw = skill_view("child-canonical")
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert result["name"] == "child-canonical"
+
+    def test_view_parses_comma_separated_related_skills(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path,
+                "csv-parent",
+                frontmatter_extra='related_skills: "skill-a, skill-b"\n',
+            )
+            raw = skill_view("csv-parent")
+        result = json.loads(raw)
+        assert result["related_skills"] == ["skill-a", "skill-b"]
 
     def test_view_nonexistent_skills_dir(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path / "nope"):

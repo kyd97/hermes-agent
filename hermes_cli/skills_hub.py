@@ -309,7 +309,7 @@ def do_browse(page: int = 1, page_size: int = 20, source: str = "all",
 
 def do_install(identifier: str, category: str = "", force: bool = False,
                console: Optional[Console] = None, skip_confirm: bool = False,
-               invalidate_cache: bool = True) -> None:
+               invalidate_cache: bool = True, analytics_event: str = "installed") -> None:
     """Fetch, quarantine, scan, confirm, and install a skill."""
     from tools.skills_hub import (
         GitHubAuth, create_source_router, ensure_hub_dirs,
@@ -452,6 +452,22 @@ def do_install(identifier: str, category: str = "", force: bool = False,
     from tools.skills_hub import SKILLS_DIR
     c.print(f"[bold green]Installed:[/] {install_dir.relative_to(SKILLS_DIR)}")
     c.print(f"[dim]Files: {', '.join(bundle.files.keys())}[/]\n")
+
+    try:
+        from agent.skill_analytics import log_skill_event
+        log_skill_event(
+            skill_name=bundle.name,
+            event_type=analytics_event,
+            trigger="skills_hub",
+            metadata={
+                "identifier": bundle.identifier,
+                "category": category,
+                "source": bundle.source,
+                "force": force,
+            },
+        )
+    except Exception:
+        pass
 
     if invalidate_cache:
         # Invalidate the skills prompt cache so the new skill appears immediately
@@ -611,7 +627,7 @@ def do_update(name: Optional[str] = None, console: Optional[Console] = None) -> 
         installed = lock.get_installed(entry["name"])
         category = _derive_category_from_install_path(installed.get("install_path", "")) if installed else ""
         c.print(f"[bold]Updating:[/] {entry['name']}")
-        do_install(entry["identifier"], category=category, force=True, console=c)
+        do_install(entry["identifier"], category=category, force=True, console=c, analytics_event="updated")
 
     c.print(f"[bold green]Updated {len(updates)} skill(s).[/]\n")
 
@@ -649,6 +665,91 @@ def do_audit(name: Optional[str] = None, console: Optional[Console] = None) -> N
         c.print()
 
 
+def do_stats(name: Optional[str] = None, days: int = 30, console: Optional[Console] = None) -> None:
+    """Show skill analytics in the terminal."""
+    from hermes_state import SessionDB
+    from tools.skills_tool import _find_all_skills
+    from hermes_cli.skills_config import get_disabled_skills
+    from hermes_cli.config import load_config
+
+    c = console or _console
+    config = load_config()
+    disabled = get_disabled_skills(config)
+    inventory = {skill["name"]: skill for skill in _find_all_skills(skip_disabled=True)}
+    db = SessionDB()
+    try:
+        if name:
+            detail = db.get_skill_detail(name, days=days)
+            skill_meta = inventory.get(name)
+            if not skill_meta:
+                c.print(f"[bold red]Error:[/] Unknown skill '{name}'.\n")
+                return
+            summary = detail.get("summary")
+            c.print(f"\n[bold]Skill stats:[/] {name} [dim](last {days} days)[/]\n")
+            if not summary:
+                c.print("[dim]No recorded activity for this skill in the selected window.[/]\n")
+                return
+            c.print(f"Category: {skill_meta.get('category') or 'general'}")
+            c.print(f"Enabled: {'yes' if name not in disabled else 'no'}")
+            c.print(f"Views: {summary.get('views', 0)} | Invocations: {summary.get('invocations', 0)} | Preloads: {summary.get('preloads', 0)} | Chained: {summary.get('chained', 0)}")
+            c.print(f"Installs: {summary.get('installs', 0)} | Updates: {summary.get('updates', 0)} | Deletes: {summary.get('deletes', 0)}")
+            c.print(f"Unique sessions: {summary.get('unique_sessions', 0)}")
+            if detail.get("by_trigger"):
+                c.print("\nTriggers:")
+                for item in detail["by_trigger"]:
+                    c.print(f"  - {item['trigger']}: {item['count']}")
+            if detail.get("recent_events"):
+                c.print("\nRecent events:")
+                for event in detail["recent_events"][:10]:
+                    c.print(f"  - {event['event_type']} via {event.get('trigger') or 'unknown'} @ {event['timestamp']:.0f}")
+            c.print()
+            return
+
+        stats_rows = db.get_skill_stats(days=days)
+    finally:
+        db.close()
+
+    if not stats_rows:
+        c.print(f"[dim]No skill activity found in the last {days} days.[/]\n")
+        return
+
+    table = Table(title=f"Skill Stats — Last {days} days")
+    table.add_column("Name", style="bold cyan")
+    table.add_column("Category", style="dim")
+    table.add_column("Enabled", style="dim")
+    table.add_column("Use", justify="right")
+    table.add_column("Views", justify="right")
+    table.add_column("Invoke", justify="right")
+    table.add_column("Preload", justify="right")
+    table.add_column("Last Used", justify="right")
+
+    def _last_used_label(ts):
+        if not ts:
+            return "never"
+        import time as _time
+        delta = max(0, int(_time.time() - ts))
+        if delta < 3600:
+            return f"{max(1, delta // 60)}m"
+        if delta < 86400:
+            return f"{delta // 3600}h"
+        return f"{delta // 86400}d"
+
+    for row in stats_rows[:25]:
+        meta = inventory.get(row["skill_name"], {})
+        usage_total = sum(int(row.get(key, 0) or 0) for key in ("views", "invocations", "preloads", "chained", "installs", "updates", "deletes"))
+        table.add_row(
+            row["skill_name"],
+            meta.get("category") or "general",
+            "yes" if row["skill_name"] not in disabled else "no",
+            str(usage_total),
+            str(int(row.get("views", 0) or 0)),
+            str(int(row.get("invocations", 0) or 0)),
+            str(int(row.get("preloads", 0) or 0)),
+            _last_used_label(row.get("last_used_at")),
+        )
+    c.print(table)
+    c.print()
+
 def do_uninstall(name: str, console: Optional[Console] = None,
                  skip_confirm: bool = False,
                  invalidate_cache: bool = True) -> None:
@@ -670,6 +771,16 @@ def do_uninstall(name: str, console: Optional[Console] = None,
 
     success, msg = uninstall_skill(name)
     if success:
+        try:
+            from agent.skill_analytics import log_skill_event
+            log_skill_event(
+                skill_name=name,
+                event_type="deleted",
+                trigger="skills_hub",
+                metadata={"message": msg},
+            )
+        except Exception:
+            pass
         c.print(f"[bold green]{msg}[/]\n")
         if invalidate_cache:
             try:
@@ -1005,6 +1116,8 @@ def skills_command(args) -> None:
         do_update(name=getattr(args, "name", None))
     elif action == "audit":
         do_audit(name=getattr(args, "name", None))
+    elif action == "stats":
+        do_stats(name=getattr(args, "name", None), days=getattr(args, "days", 30))
     elif action == "uninstall":
         do_uninstall(args.name)
     elif action == "publish":
@@ -1165,6 +1278,23 @@ def handle_skills_slash(cmd: str, console: Optional[Console] = None) -> None:
         name = args[0] if args else None
         do_audit(name=name, console=c)
 
+    elif action == "stats":
+        name = None
+        days = 30
+        i = 0
+        while i < len(args):
+            if args[i] == "--days" and i + 1 < len(args):
+                try:
+                    days = int(args[i + 1])
+                except ValueError:
+                    pass
+                i += 2
+            else:
+                if name is None:
+                    name = args[i]
+                i += 1
+        do_stats(name=name, days=days, console=c)
+
     elif action == "uninstall":
         if not args:
             c.print("[bold red]Usage:[/] /skills uninstall <name> [--now]\n")
@@ -1212,9 +1342,8 @@ def handle_skills_slash(cmd: str, console: Optional[Console] = None) -> None:
 
     elif action in ("help", "--help", "-h"):
         _print_skills_help(c)
-
     else:
-        c.print(f"[bold red]Unknown action:[/] {action}")
+        c.print(f"[bold red]Unknown /skills subcommand:[/] {action}\n")
         _print_skills_help(c)
 
 
@@ -1230,6 +1359,7 @@ def _print_skills_help(console: Console) -> None:
         "  [cyan]check[/] [name]                Check hub skills for upstream updates\n"
         "  [cyan]update[/] [name]               Update hub skills with upstream changes\n"
         "  [cyan]audit[/] [name]                Re-scan hub skills for security\n"
+        "  [cyan]stats[/] [name] [--days N]     Show skill analytics in the terminal\n"
         "  [cyan]uninstall[/] <name>            Remove a hub-installed skill\n"
         "  [cyan]publish[/] <path> --repo <r>   Publish a skill to GitHub via PR\n"
         "  [cyan]snapshot[/] export|import      Export/import skill configurations\n"

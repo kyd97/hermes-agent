@@ -59,6 +59,7 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
+    build_attachment_record,
     cache_audio_from_bytes,
     cache_document_from_bytes,
     cache_image_from_bytes,
@@ -1252,13 +1253,14 @@ class WeixinAdapter(BasePlatformAdapter):
         text = _extract_text(item_list)
         media_paths: List[str] = []
         media_types: List[str] = []
+        attachments = []
 
         for item in item_list:
-            await self._collect_media(item, media_paths, media_types)
+            await self._collect_media(item, media_paths, media_types, attachments)
             ref_message = item.get("ref_msg") or {}
             ref_item = ref_message.get("message_item")
             if isinstance(ref_item, dict):
-                await self._collect_media(ref_item, media_paths, media_types)
+                await self._collect_media(ref_item, media_paths, media_types, attachments)
 
         if not text and not media_paths:
             return
@@ -1277,6 +1279,7 @@ class WeixinAdapter(BasePlatformAdapter):
             message_id=message_id or None,
             media_urls=media_paths,
             media_types=media_types,
+            attachments=attachments,
             timestamp=datetime.now(),
         )
         logger.info("[%s] inbound from=%s type=%s media=%d", self.name, _safe_id(sender_id), source.chat_type, len(media_paths))
@@ -1289,28 +1292,46 @@ class WeixinAdapter(BasePlatformAdapter):
             return sender_id in self._allow_from
         return True
 
-    async def _collect_media(self, item: Dict[str, Any], media_paths: List[str], media_types: List[str]) -> None:
+    async def _collect_media(self, item: Dict[str, Any], media_paths: List[str], media_types: List[str], attachments: List[Any]) -> None:
         item_type = item.get("type")
         if item_type == ITEM_IMAGE:
             path = await self._download_image(item)
             if path:
                 media_paths.append(path)
                 media_types.append("image/jpeg")
+                attachments.append(
+                    build_attachment_record(path, "image/jpeg", filename=os.path.basename(path), message_type=MessageType.PHOTO)
+                )
         elif item_type == ITEM_VIDEO:
             path = await self._download_video(item)
             if path:
                 media_paths.append(path)
                 media_types.append("video/mp4")
+                attachments.append(
+                    build_attachment_record(path, "video/mp4", filename=os.path.basename(path), message_type=MessageType.VIDEO)
+                )
         elif item_type == ITEM_FILE:
             path, mime = await self._download_file(item)
             if path:
                 media_paths.append(path)
                 media_types.append(mime)
+                file_item = item.get("file_item") or {}
+                attachments.append(
+                    build_attachment_record(
+                        path,
+                        mime,
+                        filename=str(file_item.get("file_name") or os.path.basename(path)),
+                        message_type=MessageType.DOCUMENT,
+                    )
+                )
         elif item_type == ITEM_VOICE:
             voice_path = await self._download_voice(item)
             if voice_path:
                 media_paths.append(voice_path)
                 media_types.append("audio/silk")
+                attachments.append(
+                    build_attachment_record(voice_path, "audio/silk", filename=os.path.basename(voice_path), message_type=MessageType.VOICE)
+                )
 
     async def _download_image(self, item: Dict[str, Any]) -> Optional[str]:
         media = _media_reference(item, "image_item")

@@ -46,6 +46,37 @@ class TestFlushAfterCompression:
             )
         return agent
 
+    def test_compress_context_passes_memory_hints_to_compressor(self):
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            db = SessionDB(db_path=db_path)
+            agent = self._make_agent(db)
+            agent.flush_memories = MagicMock()
+            agent._memory_manager = MagicMock()
+            agent._memory_manager.on_pre_compress.return_value = "Preserve deployment decisions"
+            agent.context_compressor.compress = MagicMock(return_value=[{"role": "user", "content": "summary"}])
+            agent.context_compressor._last_generated_summary = "[CONTEXT COMPACTION] deployment summary"
+            agent._build_system_prompt = MagicMock(return_value="system")
+            agent._invalidate_system_prompt = MagicMock()
+
+            messages = [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "world"},
+                {"role": "user", "content": "follow-up"},
+                {"role": "assistant", "content": "answer"},
+            ]
+
+            agent._compress_context(messages, "base-system")
+
+            kwargs = agent.context_compressor.compress.call_args.kwargs
+            assert kwargs["memory_hints"] == "Preserve deployment decisions"
+
+            summaries = db.search_episodic_summaries("deployment summary")
+            assert len(summaries) == 1
+            assert summaries[0]["session_id"] == "original-session"
+
     def test_flush_after_compression_with_long_history(self):
         """The actual bug: conversation_history longer than compressed messages.
 

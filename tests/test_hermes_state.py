@@ -83,6 +83,150 @@ class TestSessionLifecycle:
         child = db.get_session("child")
         assert child["parent_session_id"] == "parent"
 
+    def test_get_lineage_session_ids_includes_ancestors_and_descendants(self, db):
+        db.create_session(session_id="root", source="cli")
+        db.create_session(session_id="mid", source="cli", parent_session_id="root")
+        db.create_session(session_id="leaf", source="cli", parent_session_id="mid")
+
+        lineage = db.get_lineage_session_ids("mid")
+
+        assert set(lineage) == {"root", "mid", "leaf"}
+
+
+class TestEpisodicSummaries:
+    def test_append_and_search_episodic_summary(self, db):
+        db.create_session(session_id="s1", source="cli", model="test-model")
+        db.append_episodic_summary(
+            "s1",
+            "Investigated the deployment bug and fixed the nginx timeout.",
+            kind="compression",
+        )
+
+        results = db.search_episodic_summaries("nginx timeout")
+
+        assert len(results) == 1
+        assert results[0]["session_id"] == "s1"
+        assert "nginx timeout" in results[0]["summary"].lower()
+        assert results[0]["source"] == "cli"
+
+    def test_search_episodic_summary_excludes_lineage_sessions(self, db):
+        db.create_session(session_id="root", source="cli")
+        db.create_session(session_id="child", source="cli", parent_session_id="root")
+        db.create_session(session_id="other", source="cli")
+        db.append_episodic_summary("root", "Root session summary about docker auth.")
+        db.append_episodic_summary("other", "Other summary about docker auth.")
+
+        results = db.search_episodic_summaries(
+            "docker auth",
+            exclude_session_ids=db.get_lineage_session_ids("child"),
+        )
+
+        assert len(results) == 1
+        assert results[0]["session_id"] == "other"
+
+    def test_search_episodic_summary_can_scope_to_source_and_user(self, db):
+        db.create_session(session_id="cli-a", source="cli", user_id="alice")
+        db.create_session(session_id="cli-b", source="cli", user_id="bob")
+        db.create_session(session_id="telegram-a", source="telegram", user_id="alice")
+        db.append_episodic_summary("cli-a", "Summary about postgres vacuum tuning.")
+        db.append_episodic_summary("cli-b", "Summary about postgres vacuum tuning.")
+        db.append_episodic_summary("telegram-a", "Summary about postgres vacuum tuning.")
+
+        results = db.search_episodic_summaries(
+            "postgres vacuum",
+            source="cli",
+            user_id="alice",
+        )
+
+        assert len(results) == 1
+        assert results[0]["session_id"] == "cli-a"
+
+
+class TestSkillAnalytics:
+    def test_log_skill_event_and_stats(self, db):
+        db.log_skill_event(
+            skill_name="plan",
+            event_type="invoked",
+            session_key="cli:one",
+            source="cli",
+            trigger="slash_command",
+            timestamp=time.time(),
+        )
+        db.log_skill_event(
+            skill_name="plan",
+            event_type="viewed",
+            session_key="cli:one",
+            source="cli",
+            trigger="tool_call",
+            timestamp=time.time(),
+        )
+        db.log_skill_event(
+            skill_name="plan",
+            event_type="preloaded",
+            session_key="cli:two",
+            source="cli",
+            trigger="preload_flag",
+            timestamp=time.time(),
+        )
+        db.log_skill_event(
+            skill_name="child",
+            event_type="chained",
+            session_key="cli:one",
+            source="cli",
+            parent_skill_name="plan",
+            timestamp=time.time(),
+        )
+
+        stats = db.get_skill_stats(days=30)
+        by_name = {row["skill_name"]: row for row in stats}
+        assert by_name["plan"]["invocations"] == 1
+        assert by_name["plan"]["views"] == 1
+        assert by_name["plan"]["preloads"] == 1
+        assert by_name["plan"]["unique_sessions"] == 2
+        assert by_name["child"]["chained"] == 1
+
+        analytics = db.get_skill_analytics(days=30)
+        assert analytics["totals"]["total_events"] == 4
+        assert analytics["totals"]["total_views"] == 1
+        assert analytics["totals"]["total_invocations"] == 1
+        assert analytics["totals"]["total_preloads"] == 1
+        assert analytics["totals"]["total_chained"] == 1
+        assert analytics["totals"]["unique_skills_used"] == 2
+
+        detail = db.get_skill_detail("plan", days=30)
+        assert detail["summary"]["views"] == 1
+        assert detail["summary"]["invocations"] == 1
+        assert detail["summary"]["preloads"] == 1
+        assert detail["by_trigger"]
+        assert detail["recent_events"]
+
+    def test_backfill_skill_events_from_messages(self, db):
+        db.create_session(session_id="hist-1", source="cli")
+        db.append_message(
+            "hist-1",
+            role="user",
+            content='[SYSTEM: The user has invoked the "plan" skill, indicating they want you to follow its instructions.]',
+        )
+        db.append_message(
+            "hist-1",
+            role="user",
+            content='[SYSTEM: The user launched this CLI session with the "debug" skill preloaded.]',
+        )
+        db.append_message(
+            "hist-1",
+            role="user",
+            content='[SYSTEM: The "debug" skill declares "plan" as a related skill. Treat the following as additional guidance automatically chained from the related skill graph.]',
+        )
+
+        result = db.backfill_skill_events_from_messages()
+        assert result["success"] is True
+        assert result["events_backfilled"] == 3
+
+        stats = db.get_skill_stats(days=30)
+        by_name = {row["skill_name"]: row for row in stats}
+        assert by_name["plan"]["invocations"] == 1
+        assert by_name["plan"]["chained"] == 1
+        assert by_name["debug"]["preloads"] == 1
 
 # =========================================================================
 # Message storage
@@ -935,7 +1079,7 @@ class TestSchemaInit:
     def test_schema_version(self, db):
         cursor = db._conn.execute("SELECT version FROM schema_version")
         version = cursor.fetchone()[0]
-        assert version == 6
+        assert version == 8
 
     def test_title_column_exists(self, db):
         """Verify the title column was created in the sessions table."""
@@ -991,12 +1135,12 @@ class TestSchemaInit:
         conn.commit()
         conn.close()
 
-        # Open with SessionDB — should migrate to v6
+        # Open with SessionDB — should migrate to v8
         migrated_db = SessionDB(db_path=db_path)
 
         # Verify migration
         cursor = migrated_db._conn.execute("SELECT version FROM schema_version")
-        assert cursor.fetchone()[0] == 6
+        assert cursor.fetchone()[0] == 8
 
         # Verify title column exists and is NULL for existing sessions
         session = migrated_db.get_session("existing")

@@ -529,6 +529,8 @@ class TestDispatchMessage(unittest.TestCase):
         self.assertEqual(len(captured_events), 1)
         self.assertEqual(captured_events[0].message_type, MessageType.PHOTO)
         self.assertEqual(captured_events[0].media_urls, ["/tmp/img.jpg"])
+        self.assertEqual(captured_events[0].attachments[0].filename, "img.jpg")
+        self.assertEqual(captured_events[0].attachments[0].media_type, "image/jpeg")
 
     def test_source_built_correctly(self):
         """Session source should have correct chat_id and user info."""

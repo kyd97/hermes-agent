@@ -5,6 +5,7 @@ import pytest
 from pathlib import Path
 
 from tools.cronjob_tools import (
+    CRONJOB_SCHEMA,
     _scan_cron_prompt,
     check_cronjob_requirements,
     cronjob,
@@ -403,3 +404,62 @@ class TestUnifiedCronjobTool:
         assert updated["success"] is True
         assert updated["job"]["skills"] == []
         assert updated["job"]["skill"] is None
+
+    def test_schema_exposes_delegate_execution_fields(self):
+        props = CRONJOB_SCHEMA["parameters"]["properties"]
+        assert "execution_mode" in props
+        assert "delegate" in props
+        assert "tasks" in props["delegate"]["properties"]
+
+    def test_create_delegate_fanout_job(self):
+        result = json.loads(
+            cronjob(
+                action="create",
+                schedule="every 1h",
+                execution_mode="delegate",
+                delegate={
+                    "context": "Shared context for all child tasks.",
+                    "tasks": [
+                        {"goal": "Check deployment status", "toolsets": ["terminal", "file"]},
+                        {"goal": "Summarize recent errors", "context": "Inspect the last 100 log lines."},
+                    ],
+                },
+                name="Delegated fanout",
+            )
+        )
+        assert result["success"] is True
+        assert result["job"]["execution_mode"] == "delegate"
+        assert len(result["job"]["delegate"]["tasks"]) == 2
+
+        from cron.jobs import get_job
+
+        stored = get_job(result["job_id"])
+        assert stored["execution_mode"] == "delegate"
+        assert stored["delegate"]["tasks"][0]["goal"] == "Check deployment status"
+        assert stored["delegate"]["tasks"][0]["toolsets"] == ["terminal", "file"]
+
+        listing = json.loads(cronjob(action="list"))
+        job = listing["jobs"][0]
+        assert job["execution_mode"] == "delegate"
+        assert job["delegate"]["tasks"][0]["goal"] == "Check deployment status"
+
+    def test_update_can_clear_delegate_config(self):
+        created = json.loads(
+            cronjob(
+                action="create",
+                schedule="every 1h",
+                execution_mode="delegate",
+                delegate={"goal": "Run delegated task", "toolsets": ["terminal"]},
+            )
+        )
+        updated = json.loads(
+            cronjob(
+                action="update",
+                job_id=created["job_id"],
+                execution_mode="agent",
+                delegate={},
+            )
+        )
+        assert updated["success"] is True
+        assert updated["job"]["execution_mode"] == "agent"
+        assert updated["job"].get("delegate") is None

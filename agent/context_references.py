@@ -15,7 +15,7 @@ from agent.model_metadata import estimate_tokens_rough
 
 _QUOTED_REFERENCE_VALUE = r'(?:`[^`\n]+`|"[^"\n]+"|\'[^\'\n]+\')'
 REFERENCE_PATTERN = re.compile(
-    rf"(?<![\w/])@(?:(?P<simple>diff|staged)\b|(?P<kind>file|folder|git|url):(?P<value>{_QUOTED_REFERENCE_VALUE}(?::\d+(?:-\d+)?)?|\S+))"
+    rf"(?<![\w/])@(?:(?P<simple>diff|staged)\b|(?P<kind>file|folder|git|url|kb):(?P<value>{_QUOTED_REFERENCE_VALUE}(?::\d+(?:-\d+)?)?|\S+))"
 )
 TRAILING_PUNCTUATION = ",.;!?"
 _SENSITIVE_HOME_DIRS = (".ssh", ".aws", ".gnupg", ".kube", ".docker", ".azure", ".config/gh")
@@ -227,6 +227,8 @@ async def _expand_reference(
             if not content:
                 return f"{ref.raw}: no content extracted", None
             return None, f"🌐 {ref.raw} ({estimate_tokens_rough(content)} tokens)\n{content}"
+        if ref.kind == "kb":
+            return _expand_workspace_knowledge_reference(ref, cwd)
     except Exception as exc:
         return f"{ref.raw}: {exc}", None
 
@@ -275,6 +277,24 @@ def _expand_folder_reference(
 
     listing = _build_folder_listing(path, cwd)
     return None, f"📁 {ref.raw} ({estimate_tokens_rough(listing)} tokens)\n{listing}"
+
+
+def _expand_workspace_knowledge_reference(
+    ref: ContextReference,
+    cwd: Path,
+) -> tuple[str | None, str | None]:
+    entry = _resolve_workspace_knowledge_entry(cwd, ref.target)
+    if entry is None:
+        return f"{ref.raw}: workspace knowledge entry not found", None
+    if isinstance(entry, str):
+        return f"{ref.raw}: {entry}", None
+
+    label, path = entry
+    text = path.read_text(encoding="utf-8")
+    from agent.prompt_builder import _scan_context_content
+    text = _scan_context_content(text, label)
+    lang = _code_fence_language(path)
+    return None, f"📚 {label} ({estimate_tokens_rough(text)} tokens)\n```{lang}\n{text}\n```"
 
 
 def _expand_git_reference(
@@ -337,6 +357,80 @@ def _resolve_path(cwd: Path, target: str, *, allowed_root: Path | None = None) -
         except ValueError as exc:
             raise ValueError("path is outside the allowed workspace") from exc
     return resolved
+
+
+def _find_git_root(start: Path) -> Path | None:
+    current = start.resolve()
+    for parent in [current, *current.parents]:
+        if (parent / ".git").exists():
+            return parent
+    return None
+
+
+def _iter_context_directories(cwd: Path) -> list[Path]:
+    stop_at = _find_git_root(cwd)
+    current = cwd.resolve()
+    directories: list[Path] = []
+    for directory in [current, *current.parents]:
+        directories.append(directory)
+        if stop_at and directory == stop_at:
+            break
+    return directories
+
+
+def _resolve_workspace_knowledge_entry(cwd: Path, target: str) -> tuple[str, Path] | str | None:
+    from agent.skill_utils import parse_frontmatter
+
+    normalized_target = target.strip().strip("/")
+    target_without_suffix = str(Path(normalized_target).with_suffix(""))
+
+    for directory in _iter_context_directories(cwd):
+        kb_dirs = []
+        for parts in ((".hermes", "knowledge"), ("HERMES.kb",)):
+            candidate = directory.joinpath(*parts)
+            try:
+                if candidate.is_dir():
+                    kb_dirs.append(candidate)
+            except OSError:
+                continue
+
+        for kb_dir in kb_dirs:
+            matches: list[tuple[str, Path]] = []
+            for child in sorted(kb_dir.rglob("*")):
+                if not child.is_file() or child.suffix.lower() not in {".md", ".mdc", ".txt"}:
+                    continue
+                rel = str(child.relative_to(kb_dir))
+                rel_no_suffix = str(Path(rel).with_suffix(""))
+                frontmatter_name = None
+                try:
+                    frontmatter, _ = parse_frontmatter(child.read_text(encoding="utf-8"))
+                    frontmatter_name = str(frontmatter.get("name") or "").strip() or None
+                except Exception:
+                    pass
+                if normalized_target in {rel, rel_no_suffix, child.stem} or (
+                    frontmatter_name and normalized_target == frontmatter_name
+                ) or target_without_suffix in {rel_no_suffix, child.stem}:
+                    matches.append((f"{child.relative_to(kb_dir)}", child))
+
+            deduped: list[tuple[str, Path]] = []
+            seen_paths: set[Path] = set()
+            for label, path in matches:
+                try:
+                    resolved = path.resolve()
+                except Exception:
+                    resolved = path
+                if resolved in seen_paths:
+                    continue
+                seen_paths.add(resolved)
+                deduped.append((label, path))
+
+            if len(deduped) > 1:
+                options = ", ".join(label for label, _ in deduped[:5])
+                return f"multiple workspace knowledge entries matched ({options})"
+            if len(deduped) == 1:
+                return deduped[0]
+
+    return None
 
 
 def _ensure_reference_path_allowed(path: Path) -> None:

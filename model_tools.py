@@ -149,6 +149,7 @@ def _discover_tools():
         "tools.rl_training_tool",
         "tools.tts_tool",
         "tools.todo_tool",
+        "tools.work_status_tool",
         "tools.memory_tool",
         "tools.session_search_tool",
         "tools.clarify_tool",

@@ -27,6 +27,9 @@ def project(tmp_path):
     frontend = tmp_path / "frontend"
     frontend.mkdir()
     (frontend / "CLAUDE.md").write_text("Frontend rules:\n- Use TypeScript\n- No any types")
+    frontend_packs = frontend / ".hermes" / "instructions"
+    frontend_packs.mkdir(parents=True)
+    (frontend_packs / "10-ui.md").write_text("Component changes must include visual QA notes.")
 
     # docs/ — no hints
     (tmp_path / "docs").mkdir()
@@ -73,6 +76,17 @@ class TestSubdirectoryHintTracker:
         )
         assert result is not None
         assert "Frontend rules" in result
+
+    def test_discovers_instruction_packs(self, project):
+        """Frontend modular instruction packs should be discovered alongside hints."""
+        tracker = SubdirectoryHintTracker(working_dir=str(project))
+        result = tracker.check_tool_call(
+            "read_file", {"path": str(project / "frontend" / "component.tsx")}
+        )
+        assert result is not None
+        assert "Project instruction packs" in result
+        assert "10-ui.md" in result
+        assert "visual QA notes" in result
 
     def test_no_duplicate_loading(self, project):
         """Same directory should not be loaded twice."""

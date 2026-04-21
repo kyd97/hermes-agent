@@ -40,6 +40,8 @@ export const api = {
   },
   getAnalytics: (days: number) =>
     fetchJSON<AnalyticsResponse>(`/api/analytics/usage?days=${days}`),
+  getSkillAnalytics: (days: number) =>
+    fetchJSON<SkillAnalyticsResponse>(`/api/analytics/skills?days=${days}`),
   getConfig: () => fetchJSON<Record<string, unknown>>("/api/config"),
   getDefaults: () => fetchJSON<Record<string, unknown>>("/api/config/defaults"),
   getSchema: () => fetchJSON<{ fields: Record<string, unknown>; category_order: string[] }>("/api/config/schema"),
@@ -100,6 +102,18 @@ export const api = {
 
   // Skills & Toolsets
   getSkills: () => fetchJSON<SkillInfo[]>("/api/skills"),
+  getSkillStats: (days: number) =>
+    fetchJSON<SkillStatsResponse>(`/api/skills/stats?days=${days}`),
+  getSkillDetail: (name: string, days: number) =>
+    fetchJSON<SkillDetailResponse>(`/api/skills/${encodeURIComponent(name)}/stats?days=${days}`),
+  getSkillCleanup: (days: number) =>
+    fetchJSON<SkillCleanupResponse>(`/api/skills/cleanup?days=${days}`),
+  runSkillBackfill: () =>
+    fetchJSON<SkillBackfillResponse>("/api/skills/backfill", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ run: true }),
+    }),
   toggleSkill: (name: string, enabled: boolean) =>
     fetchJSON<{ ok: boolean }>("/api/skills/toggle", {
       method: "PUT",
@@ -282,6 +296,54 @@ export interface AnalyticsResponse {
   };
 }
 
+export interface SkillAnalyticsDailyEntry {
+  day: string;
+  views: number;
+  invocations: number;
+  preloads: number;
+  chained: number;
+  unique_skills: number;
+}
+
+export interface SkillAnalyticsTopSkill {
+  skill_name: string;
+  category?: string | null;
+  views: number;
+  invocations: number;
+  preloads: number;
+  chained: number;
+  unique_sessions: number;
+  last_used_at?: number | null;
+  first_seen_at?: number | null;
+}
+
+export interface SkillAnalyticsCategoryEntry {
+  category: string;
+  events: number;
+  unique_skills: number;
+}
+
+export interface SkillAnalyticsResponse {
+  period_days: number;
+  daily: SkillAnalyticsDailyEntry[];
+  top_skills: SkillAnalyticsTopSkill[];
+  top_categories: SkillAnalyticsCategoryEntry[];
+  totals: {
+    total_events: number;
+    total_views: number;
+    total_invocations: number;
+    total_preloads: number;
+    total_chained: number;
+    total_installs: number;
+    total_updates: number;
+    total_deletes: number;
+    unique_skills_used: number;
+    active_skill_count: number;
+    installed_skill_count: number;
+    unused_skill_count: number;
+  };
+}
+
 export interface CronJob {
   id: string;
   name?: string;
@@ -301,6 +363,90 @@ export interface SkillInfo {
   description: string;
   category: string;
   enabled: boolean;
+  views?: number;
+  invocations?: number;
+  preloads?: number;
+  chained?: number;
+  installs?: number;
+  updates?: number;
+  deletes?: number;
+  unique_sessions?: number;
+  last_used_at?: number | null;
+  first_seen_at?: number | null;
+}
+
+export interface SkillStatsResponse {
+  period_days: number;
+  skills: SkillInfo[];
+}
+
+export interface SkillDetailResponse {
+  skill_name: string;
+  period_days: number;
+  skill: SkillInfo;
+  summary: {
+    skill_name: string;
+    views: number;
+    invocations: number;
+    preloads: number;
+    chained: number;
+    installs: number;
+    updates: number;
+    deletes: number;
+    unique_sessions: number;
+    last_used_at?: number | null;
+    first_seen_at?: number | null;
+  } | null;
+  daily: Array<{
+    day: string;
+    views: number;
+    invocations: number;
+    preloads: number;
+    chained: number;
+    installs: number;
+    updates: number;
+    deletes: number;
+  }>;
+  by_trigger: Array<{ trigger: string; count: number }>;
+  recent_events: Array<{
+    timestamp: number;
+    source?: string | null;
+    event_type: string;
+    trigger?: string | null;
+    parent_skill_name?: string | null;
+    success?: number | null;
+    metadata?: Record<string, unknown> | null;
+  }>;
+}
+
+export interface SkillCleanupResponse {
+  period_days: number;
+  dead_skills: Array<{
+    name: string;
+    category?: string | null;
+    enabled: boolean;
+    last_used_at?: number | null;
+    usage_total: number;
+    reason: string;
+  }>;
+  duplicate_candidates: Array<{
+    left: string;
+    right: string;
+    similarity: number;
+    left_usage: number;
+    right_usage: number;
+  }>;
+  summary: {
+    dead_skill_count: number;
+    duplicate_candidate_count: number;
+  };
+}
+
+export interface SkillBackfillResponse {
+  success: boolean;
+  events_backfilled?: number;
+  sessions_scanned?: number;
+  message?: string;
 }
 
 export interface ToolsetInfo {

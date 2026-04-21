@@ -5,7 +5,7 @@ import pytest
 from rich.console import Console
 
 from cli import ChatConsole
-from hermes_cli.skills_hub import do_check, do_install, do_list, do_update, handle_skills_slash
+from hermes_cli.skills_hub import do_check, do_install, do_list, do_stats, do_update, handle_skills_slash
 
 
 class _DummyLockFile:
@@ -92,10 +92,39 @@ def _capture_update(monkeypatch, results) -> tuple[str, list[tuple[str, str, boo
     monkeypatch.setattr(hub, "HubLockFile", lambda: type("L", (), {
         "get_installed": lambda self, name: {"install_path": "category/" + name}
     })())
-    monkeypatch.setattr(cli_hub, "do_install", lambda identifier, category="", force=False, console=None: installs.append((identifier, category, force)))
+    monkeypatch.setattr(cli_hub, "do_install", lambda identifier, category="", force=False, console=None, analytics_event="installed": installs.append((identifier, category, force)))
 
     do_update(console=console)
     return sink.getvalue(), installs
+
+
+def _capture_stats(monkeypatch, stats_rows, details=None) -> str:
+    import tools.skills_tool as skills_tool
+    import hermes_state
+    import hermes_cli.config as cli_config
+    import hermes_cli.skills_config as skills_config
+
+    sink = StringIO()
+    console = Console(file=sink, force_terminal=False, color_system=None)
+
+    monkeypatch.setattr(cli_config, "load_config", lambda: {"skills": {"disabled": ["disabled-skill"]}})
+    monkeypatch.setattr(skills_config, "get_disabled_skills", lambda config, platform=None: {"disabled-skill"})
+    monkeypatch.setattr(skills_tool, "_find_all_skills", lambda skip_disabled=True: [
+        {"name": "plan", "description": "Plan things", "category": "software-development"},
+        {"name": "disabled-skill", "description": "Disabled", "category": None},
+    ])
+
+    class _FakeDB:
+        def get_skill_stats(self, days=30):
+            return stats_rows
+        def get_skill_detail(self, name, days=30):
+            return details or {"summary": None, "by_trigger": [], "recent_events": []}
+        def close(self):
+            pass
+
+    monkeypatch.setattr(hermes_state, "SessionDB", lambda: _FakeDB())
+    do_stats(console=console)
+    return sink.getvalue()
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +208,15 @@ def test_do_update_reinstalls_outdated_skills(monkeypatch):
 
     assert installs == [("skills-sh/example/repo/hub-skill", "category", True)]
     assert "Updated 1 skill" in output
+
+
+def test_do_stats_renders_table(monkeypatch):
+    output = _capture_stats(monkeypatch, [
+        {"skill_name": "plan", "views": 3, "invocations": 2, "preloads": 1, "chained": 0, "installs": 1, "updates": 0, "deletes": 0, "last_used_at": 1234567890},
+    ])
+    assert "Skill Stats" in output
+    assert "plan" in output
+    assert "Views" in output
 
 
 def test_handle_skills_slash_search_accepts_chatconsole_without_status_errors():

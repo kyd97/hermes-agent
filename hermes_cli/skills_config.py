@@ -36,8 +36,14 @@ def get_disabled_skills(config: dict, platform: Optional[str] = None) -> Set[str
     return set(platform_disabled)
 
 
-def save_disabled_skills(config: dict, disabled: Set[str], platform: Optional[str] = None):
-    """Persist disabled skill names to config."""
+def save_disabled_skills(
+    config: dict,
+    disabled: Set[str],
+    platform: Optional[str] = None,
+    action_source: str = "cli",
+):
+    """Persist disabled skill names to config and log state changes."""
+    previous_disabled = get_disabled_skills(config, platform)
     config.setdefault("skills", {})
     if platform is None:
         config["skills"]["disabled"] = sorted(disabled)
@@ -45,6 +51,26 @@ def save_disabled_skills(config: dict, disabled: Set[str], platform: Optional[st
         config["skills"].setdefault("platform_disabled", {})
         config["skills"]["platform_disabled"][platform] = sorted(disabled)
     save_config(config)
+
+    try:
+        from agent.skill_analytics import log_skill_event
+
+        for skill_name in sorted(previous_disabled - disabled):
+            log_skill_event(
+                skill_name=skill_name,
+                event_type="enabled",
+                trigger=action_source,
+                metadata={"platform": platform or "global"},
+            )
+        for skill_name in sorted(disabled - previous_disabled):
+            log_skill_event(
+                skill_name=skill_name,
+                event_type="disabled",
+                trigger=action_source,
+                metadata={"platform": platform or "global"},
+            )
+    except Exception:
+        pass
 
 
 # ─── Skill Discovery ─────────────────────────────────────────────────────────

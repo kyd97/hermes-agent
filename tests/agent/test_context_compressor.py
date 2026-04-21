@@ -222,6 +222,26 @@ class TestNonStringContent:
             "api_mode": "codex_responses",
         }
 
+    def test_summary_call_includes_memory_hints(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "ok"
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True)
+
+        messages = [
+            {"role": "user", "content": "investigate the issue"},
+            {"role": "assistant", "content": "working on it"},
+        ]
+
+        with patch("agent.context_compressor.call_llm", return_value=mock_response) as mock_call:
+            c._generate_summary(messages, memory_hints="Preserve the API key rotation schedule.")
+
+        prompt = mock_call.call_args.kwargs["messages"][0]["content"]
+        assert "MEMORY PRESERVATION HINTS" in prompt
+        assert "Preserve the API key rotation schedule." in prompt
+
 
 class TestSummaryFailureCooldown:
     def test_summary_failure_enters_cooldown_and_skips_retry(self):

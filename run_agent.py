@@ -1113,6 +1113,7 @@ class AIAgent:
         # In-memory todo list for task planning (one per agent/session)
         from tools.todo_tool import TodoStore
         self._todo_store = TodoStore()
+        self._delegate_history = []
         
         # Load config once for memory, skills, and compression sections
         try:
@@ -1129,6 +1130,7 @@ class AIAgent:
         self._memory_flush_min_turns = 6
         self._turns_since_memory = 0
         self._iters_since_skill = 0
+        mem_config = {}
         if not skip_memory:
             try:
                 mem_config = _agent_cfg.get("memory", {})
@@ -1145,7 +1147,6 @@ class AIAgent:
                     self._memory_store.load_from_disk()
             except Exception:
                 pass  # Memory is optional -- don't break agent init
-        
 
 
         # Memory provider plugin (external — one at a time, alongside built-in)
@@ -1180,11 +1181,22 @@ class AIAgent:
                     except Exception:
                         pass
 
-                if _mem_provider_name:
+                if _mem_provider_name or self._memory_store:
+                    from agent.builtin_memory_provider import BuiltinMemoryProvider as _BuiltinMemoryProvider
                     from agent.memory_manager import MemoryManager as _MemoryManager
-                    from plugins.memory import load_memory_provider as _load_mem
                     self._memory_manager = _MemoryManager()
-                    _mp = _load_mem(_mem_provider_name)
+                    if self._memory_store:
+                        _builtin = _BuiltinMemoryProvider(
+                            self._memory_store,
+                            memory_enabled=self._memory_enabled,
+                            user_profile_enabled=self._user_profile_enabled,
+                        )
+                        if _builtin.is_available():
+                            self._memory_manager.add_provider(_builtin)
+                    _mp = None
+                    if _mem_provider_name:
+                        from plugins.memory import load_memory_provider as _load_mem
+                        _mp = _load_mem(_mem_provider_name)
                     if _mp and _mp.is_available():
                         self._memory_manager.add_provider(_mp)
                     if self._memory_manager.providers:
@@ -3048,6 +3060,35 @@ class AIAgent:
         except Exception:
             pass
 
+    def _record_delegate_status(self, function_args: dict, function_result: str) -> None:
+        """Capture delegate_task outcomes for unified session status surfaces."""
+        try:
+            data = json.loads(function_result)
+        except Exception:
+            return
+        results = data.get("results")
+        if not isinstance(results, list):
+            return
+        goal = str(function_args.get("goal") or "").strip()
+        tasks = function_args.get("tasks") if isinstance(function_args.get("tasks"), list) else None
+        label = goal or (f"batch:{len(tasks)}" if tasks else "delegate_task")
+        for entry in results:
+            if not isinstance(entry, dict):
+                continue
+            self._delegate_history.append(
+                {
+                    "label": label,
+                    "task_index": entry.get("task_index"),
+                    "status": entry.get("status"),
+                    "exit_reason": entry.get("exit_reason"),
+                    "summary": entry.get("summary"),
+                    "duration_seconds": entry.get("duration_seconds"),
+                    "api_calls": entry.get("api_calls"),
+                }
+            )
+        if len(self._delegate_history) > 20:
+            self._delegate_history = self._delegate_history[-20:]
+
     def _hydrate_todo_store(self, history: List[Dict[str, Any]]) -> None:
         """
         Recover todo state from conversation history.
@@ -3177,18 +3218,8 @@ class AIAgent:
         if system_message is not None:
             prompt_parts.append(system_message)
 
-        if self._memory_store:
-            if self._memory_enabled:
-                mem_block = self._memory_store.format_for_system_prompt("memory")
-                if mem_block:
-                    prompt_parts.append(mem_block)
-            # USER.md is always included when enabled.
-            if self._user_profile_enabled:
-                user_block = self._memory_store.format_for_system_prompt("user")
-                if user_block:
-                    prompt_parts.append(user_block)
-
-        # External memory provider system prompt block (additive to built-in)
+        # Built-in + external memory provider system prompt blocks now flow
+        # through MemoryManager for a single orchestration path.
         if self._memory_manager:
             try:
                 _ext_mem_block = self._memory_manager.build_system_prompt()
@@ -6724,12 +6755,20 @@ class AIAgent:
                         args = json.loads(tc.function.arguments)
                         flush_target = args.get("target", "memory")
                         from tools.memory_tool import memory_tool as _memory_tool
-                        _memory_tool(
+                        result = _memory_tool(
                             action=args.get("action"),
                             target=flush_target,
                             content=args.get("content"),
                             old_text=args.get("old_text"),
+                            memory_class=args.get("memory_class"),
                             store=self._memory_store,
+                        )
+                        self._mirror_memory_write_if_successful(
+                            args.get("action", ""),
+                            flush_target,
+                            args.get("content", ""),
+                            result,
+                            entry_class=args.get("memory_class"),
                         )
                         if not self.quiet_mode:
                             print(f"  🧠 Memory flush: saved to {args.get('target', 'memory')}")
@@ -6769,13 +6808,33 @@ class AIAgent:
         self.flush_memories(messages, min_turns=0)
 
         # Notify external memory provider before compression discards context
+        memory_hints = ""
         if self._memory_manager:
             try:
-                self._memory_manager.on_pre_compress(messages)
+                memory_hints = self._memory_manager.on_pre_compress(messages)
+            except Exception:
+                memory_hints = ""
+
+        compressed = self.context_compressor.compress(
+            messages,
+            current_tokens=approx_tokens,
+            focus_topic=focus_topic,
+            memory_hints=memory_hints,
+        )
+
+        if self._session_db:
+            try:
+                episodic_summary = getattr(self.context_compressor, "_last_generated_summary", None)
+                if episodic_summary and self.session_id:
+                    from agent.context_compressor import ContextCompressor
+                    cleaned_summary = ContextCompressor.strip_summary_prefix(episodic_summary)
+                    self._session_db.append_episodic_summary(
+                        self.session_id,
+                        cleaned_summary,
+                        kind="compression",
+                    )
             except Exception:
                 pass
-
-        compressed = self.context_compressor.compress(messages, current_tokens=approx_tokens, focus_topic=focus_topic)
 
         todo_snapshot = self._todo_store.format_for_injection()
         if todo_snapshot:
@@ -6884,6 +6943,48 @@ class AIAgent:
         finally:
             self._executing_tools = False
 
+    def _mirror_memory_write_if_successful(self, action: str, target: str, requested_content: str, result: str, *, entry_class: Optional[str] = None) -> None:
+        """Mirror successful built-in memory writes to external providers.
+
+        The built-in memory tool is the source of truth. Only forward writes to
+        external providers after parsing the tool result and confirming success,
+        so rejected writes do not desynchronize provider state.
+        """
+        if not self._memory_manager or action not in {"add", "replace", "remove"}:
+            return
+
+        try:
+            parsed_result = json.loads(result)
+        except Exception:
+            return
+
+        if not parsed_result.get("success"):
+            return
+        if parsed_result.get("changed") is False:
+            return
+
+        persisted_entry = parsed_result.get("entry") or {}
+        mirror_content = (
+            parsed_result.get("removed_content")
+            if action == "remove"
+            else persisted_entry.get("content", requested_content)
+        )
+        mirror_class = (
+            (parsed_result.get("removed_entry") or {}).get("memory_class")
+            if action == "remove"
+            else persisted_entry.get("memory_class", entry_class)
+        )
+
+        try:
+            self._memory_manager.on_memory_write(
+                action,
+                target,
+                mirror_content or "",
+                entry_class=mirror_class,
+            )
+        except Exception:
+            pass
+
     def _invoke_tool(self, function_name: str, function_args: dict, effective_task_id: str,
                      tool_call_id: Optional[str] = None) -> str:
         """Invoke a single tool and return the result string. No display logic.
@@ -6898,6 +6999,12 @@ class AIAgent:
                 todos=function_args.get("todos"),
                 merge=function_args.get("merge", False),
                 store=self._todo_store,
+            )
+        elif function_name == "work_status":
+            from tools.work_status_tool import work_status_tool as _work_status_tool
+            return _work_status_tool(
+                include_cron_jobs=function_args.get("include_cron_jobs", 5),
+                agent=self,
             )
         elif function_name == "session_search":
             if not self._session_db:
@@ -6918,18 +7025,16 @@ class AIAgent:
                 target=target,
                 content=function_args.get("content"),
                 old_text=function_args.get("old_text"),
+                memory_class=function_args.get("memory_class"),
                 store=self._memory_store,
             )
-            # Bridge: notify external memory provider of built-in memory writes
-            if self._memory_manager and function_args.get("action") in ("add", "replace"):
-                try:
-                    self._memory_manager.on_memory_write(
-                        function_args.get("action", ""),
-                        target,
-                        function_args.get("content", ""),
-                    )
-                except Exception:
-                    pass
+            self._mirror_memory_write_if_successful(
+                function_args.get("action", ""),
+                target,
+                function_args.get("content", ""),
+                result,
+                entry_class=function_args.get("memory_class"),
+            )
             return result
         elif self._memory_manager and self._memory_manager.has_tool(function_name):
             return self._memory_manager.handle_tool_call(function_name, function_args)
@@ -6942,7 +7047,7 @@ class AIAgent:
             )
         elif function_name == "delegate_task":
             from tools.delegate_tool import delegate_task as _delegate_task
-            return _delegate_task(
+            function_result = _delegate_task(
                 goal=function_args.get("goal"),
                 context=function_args.get("context"),
                 toolsets=function_args.get("toolsets"),
@@ -6950,6 +7055,8 @@ class AIAgent:
                 max_iterations=function_args.get("max_iterations"),
                 parent_agent=self,
             )
+            self._record_delegate_status(function_args, function_result)
+            return function_result
         else:
             return handle_function_call(
                 function_name, function_args, effective_task_id,
@@ -7293,11 +7400,28 @@ class AIAgent:
                     target=target,
                     content=function_args.get("content"),
                     old_text=function_args.get("old_text"),
+                    memory_class=function_args.get("memory_class"),
                     store=self._memory_store,
+                )
+                self._mirror_memory_write_if_successful(
+                    function_args.get("action", ""),
+                    target,
+                    function_args.get("content", ""),
+                    function_result,
+                    entry_class=function_args.get("memory_class"),
                 )
                 tool_duration = time.time() - tool_start_time
                 if self._should_emit_quiet_tool_messages():
                     self._vprint(f"  {_get_cute_tool_message_impl('memory', function_args, tool_duration, result=function_result)}")
+            elif function_name == "work_status":
+                from tools.work_status_tool import work_status_tool as _work_status_tool
+                function_result = _work_status_tool(
+                    include_cron_jobs=function_args.get("include_cron_jobs", 5),
+                    agent=self,
+                )
+                tool_duration = time.time() - tool_start_time
+                if self._should_emit_quiet_tool_messages():
+                    self._vprint(f"  {_get_cute_tool_message_impl('work_status', function_args, tool_duration, result=function_result)}")
             elif function_name == "clarify":
                 from tools.clarify_tool import clarify_tool as _clarify_tool
                 function_result = _clarify_tool(
@@ -7332,6 +7456,7 @@ class AIAgent:
                         max_iterations=function_args.get("max_iterations"),
                         parent_agent=self,
                     )
+                    self._record_delegate_status(function_args, function_result)
                     _delegate_result = function_result
                 finally:
                     self._delegate_spinner = None
@@ -7828,6 +7953,23 @@ class AIAgent:
         # Preserve the original user message (no nudge injection).
         original_user_message = persist_user_message if persist_user_message is not None else user_message
 
+        # Notify memory providers that a new user turn is starting before any
+        # prefetch/recall work for this turn, so providers can update cadence,
+        # scope, or caches and have that state reflected in the upcoming recall.
+        _memory_turn_message = original_user_message if isinstance(original_user_message, str) else ""
+        if self._memory_manager:
+            try:
+                self._memory_manager.on_turn_start(
+                    self._user_turn_count,
+                    _memory_turn_message,
+                    session_id=self.session_id,
+                    platform=self.platform or "cli",
+                    model=self.model,
+                    tool_count=len(self.valid_tool_names),
+                )
+            except Exception:
+                pass
+
         # Track memory nudge trigger (turn-based, checked here).
         # Skill trigger is checked AFTER the agent loop completes, based on
         # how many tool iterations THIS turn used.
@@ -7953,6 +8095,8 @@ class AIAgent:
                     # skipping them because conversation_history is still the
                     # pre-compression length.
                     conversation_history = None
+                    current_turn_user_idx = len(messages) - 1
+                    self._persist_user_message_idx = current_turn_user_idx
                     # Re-estimate after compression
                     _preflight_tokens = estimate_request_tokens_rough(
                         messages,
@@ -8023,6 +8167,34 @@ class AIAgent:
         # Use original_user_message (clean input) — user_message may contain
         # injected skill content that bloats / breaks provider queries.
         _ext_prefetch_cache = ""
+        _episodic_prefetch_cache = ""
+        if self._session_db:
+            try:
+                _query = original_user_message if isinstance(original_user_message, str) else ""
+                _exclude = self._session_db.get_lineage_session_ids(self.session_id or "") if self.session_id else []
+                _current_session = self._session_db.get_session(self.session_id) if self.session_id else None
+                _episodic_hits = self._session_db.search_episodic_summaries(
+                    _query,
+                    exclude_session_ids=_exclude,
+                    limit=3,
+                    source=_current_session.get("source") if _current_session else None,
+                    user_id=_current_session.get("user_id") if _current_session and _current_session.get("user_id") else None,
+                )
+                if _episodic_hits:
+                    _parts = [
+                        f"- [{hit.get('source') or 'unknown'}] {hit.get('summary', '').strip()}"
+                        for hit in _episodic_hits
+                        if hit.get("summary")
+                    ]
+                    if _parts:
+                        _episodic_prefetch_cache = (
+                            "<episodic-memory>\n"
+                            "[System note: Relevant prior session summaries recalled from local history.]\n\n"
+                            + "\n".join(_parts)
+                            + "\n</episodic-memory>"
+                        )
+            except Exception:
+                pass
         if self._memory_manager:
             try:
                 _query = original_user_message if isinstance(original_user_message, str) else ""
@@ -8106,6 +8278,8 @@ class AIAgent:
                 # never mutated, so nothing leaks into session persistence.
                 if idx == current_turn_user_idx and msg.get("role") == "user":
                     _injections = []
+                    if _episodic_prefetch_cache:
+                        _injections.append(_episodic_prefetch_cache)
                     if _ext_prefetch_cache:
                         _fenced = build_memory_context_block(_ext_prefetch_cache)
                         if _fenced:

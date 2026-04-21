@@ -520,3 +520,36 @@ class TestWeixinMediaBuilder:
         adapter = _make_adapter()
         media_type, builder = adapter._outbound_media_builder("recording.silk")
         assert media_type == weixin.MEDIA_VOICE
+
+
+class TestWeixinInboundAttachments:
+    def test_process_message_builds_structured_attachment_records(self):
+        adapter = _make_adapter()
+        adapter._session = object()
+        adapter.handle_message = AsyncMock()
+        adapter._maybe_fetch_typing_ticket = AsyncMock()
+        adapter._download_file = AsyncMock(return_value=("/tmp/spec.pdf", "application/pdf"))
+
+        message = {
+            "from_user_id": "wxid_user",
+            "message_id": "msg-1",
+            "context_token": "ctx-1",
+            "item_list": [
+                {
+                    "type": weixin.ITEM_FILE,
+                    "file_item": {
+                        "file_name": "spec.pdf",
+                        "media": {},
+                    },
+                }
+            ],
+        }
+
+        asyncio.run(adapter._process_message(message))
+
+        event = adapter.handle_message.call_args[0][0]
+        assert event.media_urls == ["/tmp/spec.pdf"]
+        assert event.media_types == ["application/pdf"]
+        assert event.attachments[0].filename == "spec.pdf"
+        assert event.attachments[0].media_type == "application/pdf"
+        assert event.attachments[0].kind == "document"

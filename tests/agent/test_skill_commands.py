@@ -207,6 +207,99 @@ class TestBuildPreloadedSkillsPrompt:
         assert "second-skill" in prompt
         assert "preloaded" in prompt.lower()
 
+    def test_includes_workflow_metadata_in_preloaded_prompt(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path,
+                "workflow-skill",
+                frontmatter_extra=(
+                    "metadata:\n"
+                    "  hermes:\n"
+                    "    workflow:\n"
+                    "      name: implementation\n"
+                    "      steps:\n"
+                    "        - write failing test\n"
+                    "        - implement minimal fix\n"
+                    "      verification:\n"
+                    "        - run pytest\n"
+                ),
+            )
+            prompt, loaded, missing = build_preloaded_skills_prompt(["workflow-skill"])
+
+        assert missing == []
+        assert loaded == ["workflow-skill"]
+        assert "Skill workflow" in prompt
+        assert "write failing test" in prompt
+        assert "run pytest" in prompt
+
+    def test_preloaded_prompt_chains_related_skills(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "child-skill", body="Child guidance.")
+            _make_skill(
+                tmp_path,
+                "parent-skill",
+                frontmatter_extra=(
+                    "metadata:\n"
+                    "  hermes:\n"
+                    "    related_skills: [child-skill]\n"
+                ),
+                body="Parent guidance.",
+            )
+            prompt, loaded, missing = build_preloaded_skills_prompt(["parent-skill"])
+
+        assert missing == []
+        assert loaded == ["parent-skill", "child-skill"]
+        assert "Parent guidance." in prompt
+        assert "Child guidance." in prompt
+        assert "automatically chained from the related skill graph" in prompt
+
+    def test_preloaded_prompt_logs_events(self, tmp_path, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            "agent.skill_commands.log_skill_event",
+            lambda **kwargs: calls.append(kwargs),
+        )
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "child-skill", body="Child guidance.")
+            _make_skill(
+                tmp_path,
+                "parent-skill",
+                frontmatter_extra=(
+                    "metadata:\n"
+                    "  hermes:\n"
+                    "    related_skills: [child-skill]\n"
+                ),
+                body="Parent guidance.",
+            )
+            build_preloaded_skills_prompt(["parent-skill"], task_id="sess-1")
+
+        assert [call["event_type"] for call in calls] == ["preloaded", "chained"]
+        assert calls[0]["skill_name"] == "parent-skill"
+        assert calls[1]["parent_skill_name"] == "parent-skill"
+
+    def test_preloaded_prompt_chains_related_skills_by_frontmatter_name(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            child_dir = tmp_path / "child-dir"
+            child_dir.mkdir(parents=True, exist_ok=True)
+            (child_dir / "SKILL.md").write_text(
+                "---\nname: child-canonical\ndescription: Child\n---\n\nChild guidance.\n"
+            )
+            _make_skill(
+                tmp_path,
+                "parent-skill",
+                frontmatter_extra=(
+                    "metadata:\n"
+                    "  hermes:\n"
+                    "    related_skills: [child-canonical]\n"
+                ),
+                body="Parent guidance.",
+            )
+            prompt, loaded, missing = build_preloaded_skills_prompt(["parent-skill"])
+
+        assert missing == []
+        assert loaded == ["parent-skill", "child-canonical"]
+        assert "Child guidance." in prompt
+
     def test_reports_missing_named_skills(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             _make_skill(tmp_path, "present-skill")
@@ -252,6 +345,51 @@ Generate some audio.
         assert msg is not None
         assert "test-skill" in msg
         assert "do stuff" in msg
+
+    def test_invocation_message_chains_related_skills(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "child-skill", body="Child guidance.")
+            _make_skill(
+                tmp_path,
+                "parent-skill",
+                frontmatter_extra=(
+                    "metadata:\n"
+                    "  hermes:\n"
+                    "    related_skills: [child-skill]\n"
+                ),
+                body="Parent guidance.",
+            )
+            scan_skill_commands()
+            msg = build_skill_invocation_message("/parent-skill", "do stuff")
+        assert msg is not None
+        assert "Parent guidance." in msg
+        assert "Child guidance." in msg
+        assert "automatically chained from the related skill graph" in msg
+
+    def test_invocation_message_logs_events(self, tmp_path, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            "agent.skill_commands.log_skill_event",
+            lambda **kwargs: calls.append(kwargs),
+        )
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "child-skill", body="Child guidance.")
+            _make_skill(
+                tmp_path,
+                "parent-skill",
+                frontmatter_extra=(
+                    "metadata:\n"
+                    "  hermes:\n"
+                    "    related_skills: [child-skill]\n"
+                ),
+                body="Parent guidance.",
+            )
+            scan_skill_commands()
+            build_skill_invocation_message("/parent-skill", "do stuff", task_id="sess-2")
+
+        assert [call["event_type"] for call in calls] == ["invoked", "chained"]
+        assert calls[0]["skill_name"] == "parent-skill"
+        assert calls[1]["parent_skill_name"] == "parent-skill"
 
     def test_returns_none_for_unknown(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
