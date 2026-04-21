@@ -168,6 +168,18 @@ def _normalize_string_set(values) -> Set[str]:
     return {str(v).strip() for v in values if str(v).strip()}
 
 
+def _normalize_string_list(value: Any) -> List[str]:
+    """Normalize strings / lists of strings into a compact list."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        return [text] if text else []
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
 # ── External skills directories ──────────────────────────────────────────
 
 
@@ -315,6 +327,110 @@ def extract_skill_config_vars(frontmatter: Dict[str, Any]) -> List[Dict[str, Any
         seen.add(key)
         result.append(entry)
     return result
+
+
+def extract_skill_workflow(frontmatter: Dict[str, Any]) -> Dict[str, Any] | None:
+    """Extract normalized declarative workflow metadata from skill frontmatter.
+
+    Preferred shape::
+
+        metadata:
+          hermes:
+            workflow:
+              name: bugfix
+              steps: [reproduce, patch, verify]
+              verification: [run tests]
+              deliverables: [patch]
+
+    Backward-compatible fallbacks are also supported via top-level keys
+    ``workflow``, ``workflow_steps``, ``verification_steps``, and ``deliverables``.
+    Returns None when no usable workflow metadata is declared.
+    """
+    metadata = frontmatter.get("metadata")
+    hermes = metadata.get("hermes") if isinstance(metadata, dict) else None
+    if not isinstance(hermes, dict):
+        hermes = {}
+
+    workflow_raw = hermes.get("workflow", frontmatter.get("workflow"))
+    workflow_name = ""
+    steps: List[str] = []
+    verification: List[str] = []
+    deliverables: List[str] = []
+
+    if isinstance(workflow_raw, str):
+        workflow_name = workflow_raw.strip()
+    elif isinstance(workflow_raw, list):
+        steps = _normalize_string_list(workflow_raw)
+    elif isinstance(workflow_raw, dict):
+        workflow_name = str(workflow_raw.get("name", "")).strip()
+        steps = _normalize_string_list(workflow_raw.get("steps"))
+        verification = _normalize_string_list(workflow_raw.get("verification"))
+        deliverables = _normalize_string_list(workflow_raw.get("deliverables"))
+
+    if not steps:
+        steps = _normalize_string_list(
+            hermes.get("workflow_steps", frontmatter.get("workflow_steps"))
+        )
+    if not verification:
+        verification = _normalize_string_list(
+            hermes.get("verification_steps", frontmatter.get("verification_steps"))
+        )
+    if not deliverables:
+        deliverables = _normalize_string_list(
+            hermes.get("deliverables", frontmatter.get("deliverables"))
+        )
+
+    if not workflow_name and not steps and not verification and not deliverables:
+        return None
+
+    workflow: Dict[str, Any] = {}
+    if workflow_name:
+        workflow["name"] = workflow_name
+    if steps:
+        workflow["steps"] = steps
+    if verification:
+        workflow["verification"] = verification
+    if deliverables:
+        workflow["deliverables"] = deliverables
+    return workflow
+
+
+def extract_related_skills(frontmatter: Dict[str, Any]) -> List[str]:
+    """Extract normalized related skill names from skill frontmatter.
+
+    Preferred shape::
+
+        metadata:
+          hermes:
+            related_skills: [skill-a, skill-b]
+
+    Backward-compatible top-level ``related_skills`` is also supported.
+    Strings, YAML lists, and comma-separated values are normalized into a
+    deduplicated ordered list.
+    """
+    metadata = frontmatter.get("metadata")
+    hermes = metadata.get("hermes") if isinstance(metadata, dict) else None
+    if not isinstance(hermes, dict):
+        hermes = {}
+
+    raw = hermes.get("related_skills", frontmatter.get("related_skills"))
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return []
+        if "," in text or (text.startswith("[") and text.endswith("]")):
+            return list(
+                dict.fromkeys(
+                    part.strip().strip('"\'')
+                    for part in text.strip("[]").split(",")
+                    if part.strip()
+                )
+            )
+        return [text]
+    normalized = _normalize_string_list(raw)
+    if normalized:
+        return list(dict.fromkeys(normalized))
+    return []
 
 
 def discover_all_skill_config_vars() -> List[Dict[str, Any]]:

@@ -37,6 +37,7 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
+    build_attachment_record,
     cache_document_from_bytes,
     cache_image_from_bytes,
 )
@@ -427,11 +428,20 @@ class EmailAdapter(BasePlatformAdapter):
         # Determine message type and media
         media_urls = []
         media_types = []
+        normalized_attachments = []
         msg_type = MessageType.TEXT
 
         for att in attachments:
             media_urls.append(att["path"])
             media_types.append(att["media_type"])
+            normalized_attachments.append(
+                build_attachment_record(
+                    att["path"],
+                    att.get("media_type", ""),
+                    filename=att.get("filename"),
+                    message_type=MessageType.PHOTO if att["type"] == "image" else MessageType.DOCUMENT,
+                )
+            )
             if att["type"] == "image":
                 msg_type = MessageType.PHOTO
 
@@ -456,6 +466,7 @@ class EmailAdapter(BasePlatformAdapter):
             message_id=msg_data["message_id"],
             media_urls=media_urls,
             media_types=media_types,
+            attachments=normalized_attachments,
             reply_to_message_id=msg_data["in_reply_to"] or None,
         )
 

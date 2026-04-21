@@ -1,17 +1,19 @@
 import { useEffect, useState, useCallback } from "react";
 import {
   BarChart3,
-  Brain,
   Cpu,
   Hash,
   TrendingUp,
 } from "lucide-react";
 import { api } from "@/lib/api";
-import type { AnalyticsResponse, AnalyticsDailyEntry, AnalyticsModelEntry, AnalyticsSkillEntry } from "@/lib/api";
-import { timeAgo } from "@/lib/utils";
+import type {
+  AnalyticsResponse,
+  AnalyticsDailyEntry,
+  AnalyticsModelEntry,
+  SkillAnalyticsResponse,
+} from "@/lib/api";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { useI18n } from "@/i18n";
 
 const PERIODS = [
   { label: "7d", days: 7 },
@@ -62,7 +64,6 @@ function SummaryCard({
 }
 
 function TokenBarChart({ daily }: { daily: AnalyticsDailyEntry[] }) {
-  const { t } = useI18n();
   if (daily.length === 0) return null;
 
   const maxTokens = Math.max(...daily.map((d) => d.input_tokens + d.output_tokens), 1);
@@ -72,16 +73,16 @@ function TokenBarChart({ daily }: { daily: AnalyticsDailyEntry[] }) {
       <CardHeader>
         <div className="flex items-center gap-2">
           <BarChart3 className="h-5 w-5 text-muted-foreground" />
-          <CardTitle className="text-base">{t.analytics.dailyTokenUsage}</CardTitle>
+          <CardTitle className="text-base">Daily Token Usage</CardTitle>
         </div>
           <div className="flex items-center gap-4 text-xs text-muted-foreground">
           <div className="flex items-center gap-1.5">
-            <div className="h-2.5 w-2.5 bg-[#ffe6cb]" />
-            {t.analytics.input}
+            <div className="h-2.5 w-2.5 rounded-sm bg-[#ffe6cb]" />
+            Input
           </div>
           <div className="flex items-center gap-1.5">
-            <div className="h-2.5 w-2.5 bg-emerald-500" />
-            {t.analytics.output}
+            <div className="h-2.5 w-2.5 rounded-sm bg-emerald-500" />
+            Output
           </div>
         </div>
       </CardHeader>
@@ -99,11 +100,11 @@ function TokenBarChart({ daily }: { daily: AnalyticsDailyEntry[] }) {
               >
                 {/* Tooltip */}
                 <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 hidden group-hover:block z-10 pointer-events-none">
-                  <div className="bg-card border border-border px-2.5 py-1.5 text-[10px] text-foreground shadow-lg whitespace-nowrap">
+                  <div className="rounded-md bg-card border border-border px-2.5 py-1.5 text-[10px] text-foreground shadow-lg whitespace-nowrap">
                     <div className="font-medium">{formatDate(d.day)}</div>
-                    <div>{t.analytics.input}: {formatTokens(d.input_tokens)}</div>
-                    <div>{t.analytics.output}: {formatTokens(d.output_tokens)}</div>
-                    <div>{t.analytics.total}: {formatTokens(total)}</div>
+                    <div>Input: {formatTokens(d.input_tokens)}</div>
+                    <div>Output: {formatTokens(d.output_tokens)}</div>
+                    <div>Total: {formatTokens(total)}</div>
                   </div>
                 </div>
                 {/* Input bar */}
@@ -134,7 +135,6 @@ function TokenBarChart({ daily }: { daily: AnalyticsDailyEntry[] }) {
 }
 
 function DailyTable({ daily }: { daily: AnalyticsDailyEntry[] }) {
-  const { t } = useI18n();
   if (daily.length === 0) return null;
 
   const sorted = [...daily].reverse();
@@ -144,7 +144,7 @@ function DailyTable({ daily }: { daily: AnalyticsDailyEntry[] }) {
       <CardHeader>
         <div className="flex items-center gap-2">
           <TrendingUp className="h-5 w-5 text-muted-foreground" />
-          <CardTitle className="text-base">{t.analytics.dailyBreakdown}</CardTitle>
+          <CardTitle className="text-base">Daily Breakdown</CardTitle>
         </div>
       </CardHeader>
       <CardContent>
@@ -152,10 +152,10 @@ function DailyTable({ daily }: { daily: AnalyticsDailyEntry[] }) {
           <table className="w-full text-sm">
             <thead>
               <tr className="border-b border-border text-muted-foreground text-xs">
-                <th className="text-left py-2 pr-4 font-medium">{t.analytics.date}</th>
-                <th className="text-right py-2 px-4 font-medium">{t.sessions.title}</th>
-                <th className="text-right py-2 px-4 font-medium">{t.analytics.input}</th>
-                <th className="text-right py-2 pl-4 font-medium">{t.analytics.output}</th>
+                <th className="text-left py-2 pr-4 font-medium">Date</th>
+                <th className="text-right py-2 px-4 font-medium">Sessions</th>
+                <th className="text-right py-2 px-4 font-medium">Input</th>
+                <th className="text-right py-2 pl-4 font-medium">Output</th>
               </tr>
             </thead>
             <tbody>
@@ -182,7 +182,6 @@ function DailyTable({ daily }: { daily: AnalyticsDailyEntry[] }) {
 }
 
 function ModelTable({ models }: { models: AnalyticsModelEntry[] }) {
-  const { t } = useI18n();
   if (models.length === 0) return null;
 
   const sorted = [...models].sort(
@@ -194,7 +193,7 @@ function ModelTable({ models }: { models: AnalyticsModelEntry[] }) {
       <CardHeader>
         <div className="flex items-center gap-2">
           <Cpu className="h-5 w-5 text-muted-foreground" />
-          <CardTitle className="text-base">{t.analytics.perModelBreakdown}</CardTitle>
+          <CardTitle className="text-base">Per-Model Breakdown</CardTitle>
         </div>
       </CardHeader>
       <CardContent>
@@ -202,9 +201,9 @@ function ModelTable({ models }: { models: AnalyticsModelEntry[] }) {
           <table className="w-full text-sm">
             <thead>
               <tr className="border-b border-border text-muted-foreground text-xs">
-                <th className="text-left py-2 pr-4 font-medium">{t.analytics.model}</th>
-                <th className="text-right py-2 px-4 font-medium">{t.sessions.title}</th>
-                <th className="text-right py-2 pl-4 font-medium">{t.analytics.tokens}</th>
+                <th className="text-left py-2 pr-4 font-medium">Model</th>
+                <th className="text-right py-2 px-4 font-medium">Sessions</th>
+                <th className="text-right py-2 pl-4 font-medium">Tokens</th>
               </tr>
             </thead>
             <tbody>
@@ -229,65 +228,21 @@ function ModelTable({ models }: { models: AnalyticsModelEntry[] }) {
   );
 }
 
-function SkillTable({ skills }: { skills: AnalyticsSkillEntry[] }) {
-  const { t } = useI18n();
-  if (skills.length === 0) return null;
-
-  return (
-    <Card>
-      <CardHeader>
-        <div className="flex items-center gap-2">
-          <Brain className="h-5 w-5 text-muted-foreground" />
-          <CardTitle className="text-base">{t.analytics.topSkills}</CardTitle>
-        </div>
-      </CardHeader>
-      <CardContent>
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="border-b border-border text-muted-foreground text-xs">
-                <th className="text-left py-2 pr-4 font-medium">{t.analytics.skill}</th>
-                <th className="text-right py-2 px-4 font-medium">{t.analytics.loads}</th>
-                <th className="text-right py-2 px-4 font-medium">{t.analytics.edits}</th>
-                <th className="text-right py-2 px-4 font-medium">{t.analytics.total}</th>
-                <th className="text-right py-2 pl-4 font-medium">{t.analytics.lastUsed}</th>
-              </tr>
-            </thead>
-            <tbody>
-              {skills.map((skill) => (
-                <tr key={skill.skill} className="border-b border-border/50 hover:bg-secondary/20 transition-colors">
-                  <td className="py-2 pr-4">
-                    <span className="font-mono-ui text-xs">{skill.skill}</span>
-                  </td>
-                  <td className="text-right py-2 px-4 text-muted-foreground">{skill.view_count}</td>
-                  <td className="text-right py-2 px-4 text-muted-foreground">{skill.manage_count}</td>
-                  <td className="text-right py-2 px-4">{skill.total_count}</td>
-                  <td className="text-right py-2 pl-4 text-muted-foreground">
-                    {skill.last_used_at ? timeAgo(skill.last_used_at) : "—"}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </CardContent>
-    </Card>
-  );
-}
-
 export default function AnalyticsPage() {
   const [days, setDays] = useState(30);
   const [data, setData] = useState<AnalyticsResponse | null>(null);
+  const [skillData, setSkillData] = useState<SkillAnalyticsResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const { t } = useI18n();
 
   const load = useCallback(() => {
     setLoading(true);
     setError(null);
-    api
-      .getAnalytics(days)
-      .then(setData)
+    Promise.all([api.getAnalytics(days), api.getSkillAnalytics(days)])
+      .then(([usage, skills]) => {
+        setData(usage);
+        setSkillData(skills);
+      })
       .catch((err) => setError(String(err)))
       .finally(() => setLoading(false));
   }, [days]);
@@ -300,7 +255,7 @@ export default function AnalyticsPage() {
     <div className="flex flex-col gap-6">
       {/* Period selector */}
       <div className="flex items-center gap-2">
-        <span className="text-sm text-muted-foreground font-medium">{t.analytics.period}</span>
+        <span className="text-sm text-muted-foreground font-medium">Period:</span>
         {PERIODS.map((p) => (
           <Button
             key={p.label}
@@ -334,21 +289,21 @@ export default function AnalyticsPage() {
           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
             <SummaryCard
               icon={Hash}
-              label={t.analytics.totalTokens}
+              label="Total Tokens"
               value={formatTokens(data.totals.total_input + data.totals.total_output)}
-              sub={t.analytics.inOut.replace("{input}", formatTokens(data.totals.total_input)).replace("{output}", formatTokens(data.totals.total_output))}
+              sub={`${formatTokens(data.totals.total_input)} in / ${formatTokens(data.totals.total_output)} out`}
             />
             <SummaryCard
               icon={BarChart3}
-              label={t.analytics.totalSessions}
+              label="Total Sessions"
               value={String(data.totals.total_sessions)}
-              sub={`~${(data.totals.total_sessions / days).toFixed(1)}${t.analytics.perDayAvg}`}
+              sub={`~${(data.totals.total_sessions / days).toFixed(1)}/day avg`}
             />
             <SummaryCard
               icon={TrendingUp}
-              label={t.analytics.apiCalls}
+              label="API Calls"
               value={String(data.daily.reduce((sum, d) => sum + d.sessions, 0))}
-              sub={t.analytics.acrossModels.replace("{count}", String(data.by_model.length))}
+              sub={`across ${data.by_model.length} models`}
             />
           </div>
 
@@ -358,17 +313,112 @@ export default function AnalyticsPage() {
           {/* Tables */}
           <DailyTable daily={data.daily} />
           <ModelTable models={data.by_model} />
-          <SkillTable skills={data.skills.top_skills} />
+
+          {skillData && (
+            <>
+              <div className="pt-2">
+                <h2 className="text-base font-semibold mb-3">Skill Analytics</h2>
+                <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+                  <SummaryCard
+                    icon={Cpu}
+                    label="Active Skills"
+                    value={String(skillData.totals.active_skill_count)}
+                    sub={`${skillData.totals.installed_skill_count} installed`}
+                  />
+                  <SummaryCard
+                    icon={BarChart3}
+                    label="Invocations"
+                    value={String(skillData.totals.total_invocations)}
+                    sub={`${skillData.totals.total_preloads} preloads / ${skillData.totals.total_chained} chained`}
+                  />
+                  <SummaryCard
+                    icon={Hash}
+                    label="Views"
+                    value={String(skillData.totals.total_views)}
+                    sub={`${skillData.totals.total_events} total events`}
+                  />
+                  <SummaryCard
+                    icon={TrendingUp}
+                    label="Unused Skills"
+                    value={String(skillData.totals.unused_skill_count)}
+                    sub={`last ${skillData.period_days} days`}
+                  />
+                </div>
+              </div>
+
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-base">Top Skills</CardTitle>
+                </CardHeader>
+                <CardContent>
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-sm">
+                      <thead>
+                        <tr className="border-b border-border text-muted-foreground text-xs">
+                          <th className="text-left py-2 pr-4 font-medium">Skill</th>
+                          <th className="text-left py-2 px-4 font-medium">Category</th>
+                          <th className="text-right py-2 px-4 font-medium">Views</th>
+                          <th className="text-right py-2 px-4 font-medium">Invoke</th>
+                          <th className="text-right py-2 px-4 font-medium">Preload</th>
+                          <th className="text-right py-2 pl-4 font-medium">Sessions</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {skillData.top_skills.slice(0, 10).map((skill) => (
+                          <tr key={skill.skill_name} className="border-b border-border/50 hover:bg-secondary/20 transition-colors">
+                            <td className="py-2 pr-4 font-mono-ui text-xs">{skill.skill_name}</td>
+                            <td className="py-2 px-4 text-muted-foreground">{skill.category || "general"}</td>
+                            <td className="text-right py-2 px-4">{skill.views}</td>
+                            <td className="text-right py-2 px-4">{skill.invocations}</td>
+                            <td className="text-right py-2 px-4">{skill.preloads}</td>
+                            <td className="text-right py-2 pl-4">{skill.unique_sessions}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </CardContent>
+              </Card>
+
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-base">Top Categories</CardTitle>
+                </CardHeader>
+                <CardContent>
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-sm">
+                      <thead>
+                        <tr className="border-b border-border text-muted-foreground text-xs">
+                          <th className="text-left py-2 pr-4 font-medium">Category</th>
+                          <th className="text-right py-2 px-4 font-medium">Events</th>
+                          <th className="text-right py-2 pl-4 font-medium">Skills</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {skillData.top_categories.map((category) => (
+                          <tr key={category.category} className="border-b border-border/50 hover:bg-secondary/20 transition-colors">
+                            <td className="py-2 pr-4">{category.category}</td>
+                            <td className="text-right py-2 px-4">{category.events}</td>
+                            <td className="text-right py-2 pl-4">{category.unique_skills}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </CardContent>
+              </Card>
+            </>
+          )}
         </>
       )}
 
-      {data && data.daily.length === 0 && data.by_model.length === 0 && data.skills.top_skills.length === 0 && (
+      {data && data.daily.length === 0 && data.by_model.length === 0 && (
         <Card>
           <CardContent className="py-12">
             <div className="flex flex-col items-center text-muted-foreground">
               <BarChart3 className="h-8 w-8 mb-3 opacity-40" />
-              <p className="text-sm font-medium">{t.analytics.noUsageData}</p>
-              <p className="text-xs mt-1 text-muted-foreground/60">{t.analytics.startSession}</p>
+              <p className="text-sm font-medium">No usage data for this period</p>
+              <p className="text-xs mt-1 text-muted-foreground/60">Start a session to see analytics here</p>
             </div>
           </CardContent>
         </Card>

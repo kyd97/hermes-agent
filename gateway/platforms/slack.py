@@ -40,6 +40,7 @@ from gateway.platforms.base import (
     MessageType,
     SendResult,
     SUPPORTED_DOCUMENT_TYPES,
+    build_attachment_record,
     safe_url_for_log,
     cache_document_from_bytes,
 )
@@ -1099,6 +1100,7 @@ class SlackAdapter(BasePlatformAdapter):
         # Handle file attachments
         media_urls = []
         media_types = []
+        attachments = []
         files = event.get("files", [])
         for f in files:
             mimetype = f.get("mimetype", "unknown")
@@ -1112,6 +1114,16 @@ class SlackAdapter(BasePlatformAdapter):
                     cached = await self._download_slack_file(url, ext, team_id=team_id)
                     media_urls.append(cached)
                     media_types.append(mimetype)
+                    attachments.append(
+                        build_attachment_record(
+                            cached,
+                            mimetype,
+                            filename=f.get("name"),
+                            message_type=MessageType.PHOTO,
+                            source_url=url,
+                            size_bytes=f.get("size"),
+                        )
+                    )
                     msg_type = MessageType.PHOTO
                 except Exception as e:  # pragma: no cover - defensive logging
                     logger.warning("[Slack] Failed to cache image from %s: %s", url, e, exc_info=True)
@@ -1123,6 +1135,16 @@ class SlackAdapter(BasePlatformAdapter):
                     cached = await self._download_slack_file(url, ext, audio=True, team_id=team_id)
                     media_urls.append(cached)
                     media_types.append(mimetype)
+                    attachments.append(
+                        build_attachment_record(
+                            cached,
+                            mimetype,
+                            filename=f.get("name"),
+                            message_type=MessageType.AUDIO,
+                            source_url=url,
+                            size_bytes=f.get("size"),
+                        )
+                    )
                     msg_type = MessageType.VOICE
                 except Exception as e:  # pragma: no cover - defensive logging
                     logger.warning("[Slack] Failed to cache audio from %s: %s", url, e, exc_info=True)
@@ -1158,6 +1180,16 @@ class SlackAdapter(BasePlatformAdapter):
                     doc_mime = SUPPORTED_DOCUMENT_TYPES[ext]
                     media_urls.append(cached_path)
                     media_types.append(doc_mime)
+                    attachments.append(
+                        build_attachment_record(
+                            cached_path,
+                            doc_mime,
+                            filename=original_filename or f"document{ext}",
+                            message_type=MessageType.DOCUMENT,
+                            source_url=url,
+                            size_bytes=file_size,
+                        )
+                    )
                     msg_type = MessageType.DOCUMENT
                     logger.debug("[Slack] Cached user document: %s", cached_path)
 
@@ -1206,6 +1238,7 @@ class SlackAdapter(BasePlatformAdapter):
             message_id=ts,
             media_urls=media_urls,
             media_types=media_types,
+            attachments=attachments,
             reply_to_message_id=thread_ts if thread_ts != ts else None,
             channel_prompt=_channel_prompt,
         )

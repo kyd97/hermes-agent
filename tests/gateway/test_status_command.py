@@ -3,7 +3,7 @@
 from datetime import datetime
 import time
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -91,6 +91,46 @@ async def test_status_command_reports_running_agent_without_interrupt(monkeypatc
     assert "**Title:**" not in result
     running_agent.interrupt.assert_not_called()
     assert runner._pending_messages == {}
+
+
+@pytest.mark.asyncio
+async def test_status_command_includes_unified_status_surface():
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        total_tokens=321,
+    )
+    runner = _make_runner(session_entry)
+    running_agent = MagicMock()
+    running_agent.get_activity_summary.return_value = {
+        "current_tool": "delegate_task",
+        "api_call_count": 4,
+        "budget_used": 4,
+        "budget_max": 90,
+        "seconds_since_activity": 1.2,
+    }
+    running_agent._todo_store.read.return_value = [
+        {"id": "a1", "content": "Ship status surface", "status": "in_progress"}
+    ]
+    running_agent._delegate_history = [
+        {"label": "implement status", "status": "completed", "summary": "done"}
+    ]
+    running_agent.model = "gpt-5.4"
+    running_agent.provider = "openai-codex"
+    runner._running_agents[build_session_key(_make_source())] = running_agent
+
+    with patch("cron.jobs.list_jobs", return_value=[]):
+        result = await runner._handle_message(_make_event("/status"))
+
+    assert "**Current Tool:** `delegate_task`" in result
+    assert "**Todo:** 1 total · 1 in progress" in result
+    assert "Ship status surface" in result
+    assert "**Delegations:** 1 total · 1 completed" in result
+    assert "**Cron Jobs:** 0 total · 0 enabled · 0 paused" in result
 
 
 @pytest.mark.asyncio

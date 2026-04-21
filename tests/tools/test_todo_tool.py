@@ -2,7 +2,7 @@
 
 import json
 
-from tools.todo_tool import TodoStore, todo_tool
+from tools.todo_tool import TODO_SCHEMA, TodoStore, todo_tool
 
 
 class TestWriteAndRead:
@@ -96,6 +96,99 @@ class TestMergeMode:
         )
         items = store.read()
         assert len(items) == 2
+
+    def test_write_preserves_orchestration_metadata(self):
+        store = TodoStore()
+        result = store.write([
+            {
+                "id": "1",
+                "content": "Ship feature",
+                "status": "pending",
+                "owner": "delegate:claude",
+                "dependencies": ["setup", "tests"],
+                "artifact_path": "/tmp/report.md",
+                "run_id": "run-123",
+                "priority": "high",
+            }
+        ])
+        assert result[0]["owner"] == "delegate:claude"
+        assert result[0]["dependencies"] == ["setup", "tests"]
+        assert result[0]["artifact_path"] == "/tmp/report.md"
+        assert result[0]["run_id"] == "run-123"
+        assert result[0]["priority"] == "high"
+
+    def test_merge_updates_orchestration_metadata_by_id(self):
+        store = TodoStore()
+        store.write([
+            {
+                "id": "1",
+                "content": "Ship feature",
+                "status": "pending",
+                "owner": "delegate:claude",
+                "dependencies": ["setup"],
+                "priority": "low",
+            }
+        ])
+        store.write([
+            {
+                "id": "1",
+                "run_id": "run-999",
+                "artifact_path": "/tmp/out.json",
+                "dependencies": ["setup", "tests"],
+                "priority": "urgent",
+            }
+        ], merge=True)
+        items = store.read()
+        assert items[0]["owner"] == "delegate:claude"
+        assert items[0]["run_id"] == "run-999"
+        assert items[0]["artifact_path"] == "/tmp/out.json"
+        assert items[0]["dependencies"] == ["setup", "tests"]
+        assert items[0]["priority"] == "urgent"
+
+    def test_merge_can_clear_orchestration_metadata(self):
+        store = TodoStore()
+        store.write([
+            {
+                "id": "1",
+                "content": "Ship feature",
+                "status": "pending",
+                "owner": "delegate:claude",
+                "dependencies": ["setup"],
+                "artifact_path": "/tmp/out.json",
+                "run_id": "run-123",
+                "priority": "high",
+            }
+        ])
+        store.write([
+            {
+                "id": "1",
+                "dependencies": [],
+                "artifact_path": "",
+                "run_id": None,
+                "priority": "bogus",
+            }
+        ], merge=True)
+        items = store.read()
+        assert "dependencies" not in items[0]
+        assert "artifact_path" not in items[0]
+        assert "run_id" not in items[0]
+        assert "priority" not in items[0]
+        assert items[0]["owner"] == "delegate:claude"
+
+
+class TestSchema:
+    def test_todo_schema_exposes_orchestration_metadata_fields(self):
+        item_props = TODO_SCHEMA["parameters"]["properties"]["todos"]["items"]["properties"]
+        assert {branch["type"] for branch in item_props["owner"]["anyOf"]} == {"string", "null"}
+        assert {branch["type"] for branch in item_props["dependencies"]["anyOf"]} == {"array", "null"}
+        assert {branch["type"] for branch in item_props["artifact_path"]["anyOf"]} == {"string", "null"}
+        assert {branch["type"] for branch in item_props["run_id"]["anyOf"]} == {"string", "null"}
+        assert item_props["priority"]["anyOf"][0]["enum"] == ["low", "medium", "high", "urgent"]
+
+    def test_todo_schema_allows_partial_merge_items(self):
+        item_schema = TODO_SCHEMA["parameters"]["properties"]["todos"]["items"]
+        assert item_schema["required"] == ["id"]
+        assert {branch["type"] for branch in item_schema["properties"]["priority"]["anyOf"]} == {"string", "null"}
 
 
 class TestTodoToolFunction:

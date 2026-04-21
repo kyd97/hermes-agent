@@ -70,6 +70,115 @@ def _apply_skill_fields(job: Dict[str, Any]) -> Dict[str, Any]:
     return normalized
 
 
+_VALID_EXECUTION_MODES = {"agent", "delegate"}
+
+
+def _normalize_delegate_config(delegate: Optional[Any]) -> Optional[Dict[str, Any]]:
+    """Normalize stored delegated-execution config for cron jobs."""
+    if delegate is None:
+        return None
+    if not isinstance(delegate, dict):
+        return None
+
+    normalized: Dict[str, Any] = {}
+
+    goal = str(delegate.get("goal") or "").strip()
+    if goal:
+        normalized["goal"] = goal
+
+    context = str(delegate.get("context") or "").strip()
+    if context:
+        normalized["context"] = context
+
+    toolsets = delegate.get("toolsets")
+    if isinstance(toolsets, str):
+        toolsets = [toolsets]
+    if isinstance(toolsets, list):
+        cleaned_toolsets: List[str] = []
+        for item in toolsets:
+            text = str(item or "").strip()
+            if text and text not in cleaned_toolsets:
+                cleaned_toolsets.append(text)
+        if cleaned_toolsets:
+            normalized["toolsets"] = cleaned_toolsets
+
+    tasks = delegate.get("tasks")
+    if isinstance(tasks, list):
+        cleaned_tasks: List[Dict[str, Any]] = []
+        for task in tasks:
+            if not isinstance(task, dict):
+                continue
+            task_goal = str(task.get("goal") or "").strip()
+            if not task_goal:
+                continue
+            cleaned_task: Dict[str, Any] = {"goal": task_goal}
+            task_context = str(task.get("context") or "").strip()
+            if task_context:
+                cleaned_task["context"] = task_context
+            task_toolsets = task.get("toolsets")
+            if isinstance(task_toolsets, str):
+                task_toolsets = [task_toolsets]
+            if isinstance(task_toolsets, list):
+                deduped_toolsets: List[str] = []
+                for item in task_toolsets:
+                    text = str(item or "").strip()
+                    if text and text not in deduped_toolsets:
+                        deduped_toolsets.append(text)
+                if deduped_toolsets:
+                    cleaned_task["toolsets"] = deduped_toolsets
+            acp_command = str(task.get("acp_command") or "").strip()
+            if acp_command:
+                cleaned_task["acp_command"] = acp_command
+            acp_args = task.get("acp_args")
+            if isinstance(acp_args, str):
+                acp_args = [acp_args]
+            if isinstance(acp_args, list):
+                cleaned_args = [str(arg).strip() for arg in acp_args if str(arg).strip()]
+                if cleaned_args:
+                    cleaned_task["acp_args"] = cleaned_args
+            cleaned_tasks.append(cleaned_task)
+        if cleaned_tasks:
+            normalized["tasks"] = cleaned_tasks
+
+    max_iterations = delegate.get("max_iterations")
+    try:
+        max_iterations_int = int(max_iterations)
+    except (TypeError, ValueError):
+        max_iterations_int = None
+    if max_iterations_int and max_iterations_int > 0:
+        normalized["max_iterations"] = max_iterations_int
+
+    acp_command = str(delegate.get("acp_command") or "").strip()
+    if acp_command:
+        normalized["acp_command"] = acp_command
+
+    acp_args = delegate.get("acp_args")
+    if isinstance(acp_args, str):
+        acp_args = [acp_args]
+    if isinstance(acp_args, list):
+        cleaned_args = [str(arg).strip() for arg in acp_args if str(arg).strip()]
+        if cleaned_args:
+            normalized["acp_args"] = cleaned_args
+
+    return normalized or None
+
+
+def _apply_execution_fields(job: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a job dict with canonical execution-mode metadata."""
+    normalized = dict(job)
+    execution_mode = str(normalized.get("execution_mode") or "agent").strip().lower()
+    if execution_mode not in _VALID_EXECUTION_MODES:
+        execution_mode = "agent"
+    normalized["execution_mode"] = execution_mode
+    normalized["delegate"] = _normalize_delegate_config(normalized.get("delegate"))
+    return normalized
+
+
+def _apply_job_fields(job: Dict[str, Any]) -> Dict[str, Any]:
+    """Apply all canonical field normalizers used for storage/API reads."""
+    return _apply_execution_fields(_apply_skill_fields(job))
+
+
 def _secure_dir(path: Path):
     """Set directory to owner-only access (0700). No-op on Windows."""
     try:
@@ -384,6 +493,8 @@ def create_job(
     provider: Optional[str] = None,
     base_url: Optional[str] = None,
     script: Optional[str] = None,
+    execution_mode: Optional[str] = None,
+    delegate: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -433,6 +544,10 @@ def create_job(
     normalized_base_url = normalized_base_url or None
     normalized_script = str(script).strip() if isinstance(script, str) else None
     normalized_script = normalized_script or None
+    normalized_execution_mode = str(execution_mode or "agent").strip().lower() or "agent"
+    if normalized_execution_mode not in _VALID_EXECUTION_MODES:
+        normalized_execution_mode = "agent"
+    normalized_delegate = _normalize_delegate_config(delegate)
 
     label_source = (prompt or (normalized_skills[0] if normalized_skills else None)) or "cron job"
     job = {
@@ -445,6 +560,8 @@ def create_job(
         "provider": normalized_provider,
         "base_url": normalized_base_url,
         "script": normalized_script,
+        "execution_mode": normalized_execution_mode,
+        "delegate": normalized_delegate,
         "schedule": parsed_schedule,
         "schedule_display": parsed_schedule.get("display", schedule),
         "repeat": {
@@ -470,7 +587,7 @@ def create_job(
     jobs.append(job)
     save_jobs(jobs)
 
-    return job
+    return _apply_job_fields(job)
 
 
 def get_job(job_id: str) -> Optional[Dict[str, Any]]:
@@ -478,13 +595,13 @@ def get_job(job_id: str) -> Optional[Dict[str, Any]]:
     jobs = load_jobs()
     for job in jobs:
         if job["id"] == job_id:
-            return _apply_skill_fields(job)
+            return _apply_job_fields(job)
     return None
 
 
 def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
     """List all jobs, optionally including disabled ones."""
-    jobs = [_apply_skill_fields(j) for j in load_jobs()]
+    jobs = [_apply_job_fields(j) for j in load_jobs()]
     if not include_disabled:
         jobs = [j for j in jobs if j.get("enabled", True)]
     return jobs
@@ -497,7 +614,7 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
         if job["id"] != job_id:
             continue
 
-        updated = _apply_skill_fields({**job, **updates})
+        updated = _apply_job_fields({**job, **updates})
         schedule_changed = "schedule" in updates
 
         if "skills" in updates or "skill" in updates:
@@ -525,7 +642,7 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
 
         jobs[i] = updated
         save_jobs(jobs)
-        return _apply_skill_fields(jobs[i])
+        return _apply_job_fields(jobs[i])
     return None
 
 
@@ -679,7 +796,7 @@ def get_due_jobs() -> List[Dict[str, Any]]:
     """
     now = _hermes_now()
     raw_jobs = load_jobs()
-    jobs = [_apply_skill_fields(j) for j in copy.deepcopy(raw_jobs)]
+    jobs = [_apply_job_fields(j) for j in copy.deepcopy(raw_jobs)]
     due = []
     needs_save = False
 

@@ -114,6 +114,95 @@ def _canonical_skills(skill: Optional[str] = None, skills: Optional[Any] = None)
     return normalized
 
 
+def _normalize_delegate_payload(delegate: Optional[Any]) -> Optional[Dict[str, Any]]:
+    """Normalize cron delegated-execution config at the tool boundary."""
+    if delegate is None:
+        return None
+    if not isinstance(delegate, dict):
+        raise ValueError("delegate must be an object")
+
+    normalized: Dict[str, Any] = {}
+    for field in ("goal", "context", "acp_command"):
+        value = str(delegate.get(field) or "").strip()
+        if value:
+            normalized[field] = value
+
+    toolsets = delegate.get("toolsets")
+    if isinstance(toolsets, str):
+        toolsets = [toolsets]
+    if isinstance(toolsets, list):
+        cleaned_toolsets: List[str] = []
+        for item in toolsets:
+            text = str(item or "").strip()
+            if text and text not in cleaned_toolsets:
+                cleaned_toolsets.append(text)
+        if cleaned_toolsets:
+            normalized["toolsets"] = cleaned_toolsets
+
+    tasks = delegate.get("tasks")
+    if isinstance(tasks, list):
+        cleaned_tasks: List[Dict[str, Any]] = []
+        for task in tasks:
+            if not isinstance(task, dict):
+                continue
+            goal = str(task.get("goal") or "").strip()
+            if not goal:
+                continue
+            cleaned_task: Dict[str, Any] = {"goal": goal}
+            context = str(task.get("context") or "").strip()
+            if context:
+                cleaned_task["context"] = context
+            task_toolsets = task.get("toolsets")
+            if isinstance(task_toolsets, str):
+                task_toolsets = [task_toolsets]
+            if isinstance(task_toolsets, list):
+                deduped_toolsets: List[str] = []
+                for item in task_toolsets:
+                    text = str(item or "").strip()
+                    if text and text not in deduped_toolsets:
+                        deduped_toolsets.append(text)
+                if deduped_toolsets:
+                    cleaned_task["toolsets"] = deduped_toolsets
+            task_acp_command = str(task.get("acp_command") or "").strip()
+            if task_acp_command:
+                cleaned_task["acp_command"] = task_acp_command
+            acp_args = task.get("acp_args")
+            if isinstance(acp_args, str):
+                acp_args = [acp_args]
+            if isinstance(acp_args, list):
+                cleaned_args = [str(arg).strip() for arg in acp_args if str(arg).strip()]
+                if cleaned_args:
+                    cleaned_task["acp_args"] = cleaned_args
+            cleaned_tasks.append(cleaned_task)
+        if cleaned_tasks:
+            normalized["tasks"] = cleaned_tasks
+
+    max_iterations = delegate.get("max_iterations")
+    if max_iterations is not None:
+        try:
+            max_iterations = int(max_iterations)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("delegate.max_iterations must be an integer") from exc
+        if max_iterations > 0:
+            normalized["max_iterations"] = max_iterations
+
+    acp_args = delegate.get("acp_args")
+    if isinstance(acp_args, str):
+        acp_args = [acp_args]
+    if isinstance(acp_args, list):
+        cleaned_args = [str(arg).strip() for arg in acp_args if str(arg).strip()]
+        if cleaned_args:
+            normalized["acp_args"] = cleaned_args
+
+    return normalized or None
+
+
+def _delegate_has_work(delegate: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(delegate, dict):
+        return False
+    if delegate.get("tasks"):
+        return True
+    return bool(str(delegate.get("goal") or "").strip())
 
 
 def _resolve_model_override(model_obj: Optional[Dict[str, Any]]) -> tuple:
@@ -201,6 +290,7 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         "model": job.get("model"),
         "provider": job.get("provider"),
         "base_url": job.get("base_url"),
+        "execution_mode": job.get("execution_mode", "agent"),
         "schedule": job.get("schedule_display"),
         "repeat": _repeat_display(job),
         "deliver": job.get("deliver", "local"),
@@ -213,6 +303,8 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         "paused_at": job.get("paused_at"),
         "paused_reason": job.get("paused_reason"),
     }
+    if job.get("delegate"):
+        result["delegate"] = job["delegate"]
     if job.get("script"):
         result["script"] = job["script"]
     return result
@@ -234,6 +326,8 @@ def cronjob(
     base_url: Optional[str] = None,
     reason: Optional[str] = None,
     script: Optional[str] = None,
+    execution_mode: Optional[str] = None,
+    delegate: Optional[Dict[str, Any]] = None,
     task_id: str = None,
 ) -> str:
     """Unified cron job management tool."""
@@ -246,8 +340,15 @@ def cronjob(
             if not schedule:
                 return tool_error("schedule is required for create", success=False)
             canonical_skills = _canonical_skills(skill, skills)
-            if not prompt and not canonical_skills:
-                return tool_error("create requires either prompt or at least one skill", success=False)
+            normalized_delegate = _normalize_delegate_payload(delegate)
+            normalized_execution_mode = str(execution_mode or "agent").strip().lower() or "agent"
+            if normalized_execution_mode not in {"agent", "delegate"}:
+                return tool_error("execution_mode must be 'agent' or 'delegate'", success=False)
+            if not prompt and not canonical_skills and not _delegate_has_work(normalized_delegate):
+                return tool_error(
+                    "create requires prompt, at least one skill, or delegate.goal / delegate.tasks",
+                    success=False,
+                )
             if prompt:
                 scan_error = _scan_cron_prompt(prompt)
                 if scan_error:
@@ -271,6 +372,8 @@ def cronjob(
                 provider=_normalize_optional_job_value(provider),
                 base_url=_normalize_optional_job_value(base_url, strip_trailing_slash=True),
                 script=_normalize_optional_job_value(script),
+                execution_mode=normalized_execution_mode,
+                delegate=normalized_delegate,
             )
             return json.dumps(
                 {
@@ -360,6 +463,13 @@ def cronjob(
                     if script_error:
                         return tool_error(script_error, success=False)
                 updates["script"] = _normalize_optional_job_value(script) if script else None
+            if execution_mode is not None:
+                normalized_execution_mode = str(execution_mode or "agent").strip().lower() or "agent"
+                if normalized_execution_mode not in {"agent", "delegate"}:
+                    return tool_error("execution_mode must be 'agent' or 'delegate'", success=False)
+                updates["execution_mode"] = normalized_execution_mode
+            if delegate is not None:
+                updates["delegate"] = _normalize_delegate_payload(delegate)
             if repeat is not None:
                 # Normalize: treat 0 or negative as None (infinite)
                 normalized_repeat = None if repeat <= 0 else repeat
@@ -459,6 +569,37 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                 "type": "string",
                 "description": f"Optional path to a Python script that runs before each cron job execution. Its stdout is injected into the prompt as context. Use for data collection and change detection. Relative paths resolve under {display_hermes_home()}/scripts/. On update, pass empty string to clear."
             },
+            "execution_mode": {
+                "type": "string",
+                "description": "Optional execution mode. 'agent' (default) runs one fresh cron session normally. 'delegate' spins up a lightweight controller and executes the job through delegate_task, enabling delegated subagent execution and fan-out batches."
+            },
+            "delegate": {
+                "type": "object",
+                "description": "Optional delegated-execution config. Use with execution_mode='delegate' to run one delegated task or a fan-out batch. If omitted, delegate mode falls back to using prompt as the delegated goal.",
+                "properties": {
+                    "goal": {"type": "string", "description": "Single delegated task goal. Optional when tasks[] is provided or when prompt should be reused as the goal."},
+                    "context": {"type": "string", "description": "Shared delegated context. For fan-out batches this is prepended to every child task context."},
+                    "toolsets": {"type": "array", "items": {"type": "string"}, "description": "Toolsets for delegated subagents in single-task mode, or defaults for fan-out tasks that omit toolsets."},
+                    "tasks": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "goal": {"type": "string"},
+                                "context": {"type": "string"},
+                                "toolsets": {"type": "array", "items": {"type": "string"}},
+                                "acp_command": {"type": "string"},
+                                "acp_args": {"type": "array", "items": {"type": "string"}}
+                            },
+                            "required": ["goal"]
+                        },
+                        "description": "Fan-out batch definition. Each task becomes its own delegated child agent at cron run time."
+                    },
+                    "max_iterations": {"type": "integer", "description": "Optional max tool-calling turns per delegated child."},
+                    "acp_command": {"type": "string", "description": "Optional top-level ACP command override for delegated children."},
+                    "acp_args": {"type": "array", "items": {"type": "string"}, "description": "Optional top-level ACP args override for delegated children."}
+                }
+            },
         },
         "required": ["action"]
     }
@@ -503,6 +644,8 @@ registry.register(
         base_url=args.get("base_url"),
         reason=args.get("reason"),
         script=args.get("script"),
+        execution_mode=args.get("execution_mode"),
+        delegate=args.get("delegate"),
         task_id=kw.get("task_id"),
     ))(),
     check_fn=check_cronjob_requirements,

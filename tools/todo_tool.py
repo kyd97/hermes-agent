@@ -20,6 +20,8 @@ from typing import Dict, Any, List, Optional
 
 # Valid status values for todo items
 VALID_STATUSES = {"pending", "in_progress", "completed", "cancelled"}
+VALID_PRIORITIES = {"low", "medium", "high", "urgent"}
+OPTIONAL_METADATA_FIELDS = ("owner", "dependencies", "artifact_path", "run_id", "priority")
 
 
 class TodoStore:
@@ -33,9 +35,9 @@ class TodoStore:
     """
 
     def __init__(self):
-        self._items: List[Dict[str, str]] = []
+        self._items: List[Dict[str, Any]] = []
 
-    def write(self, todos: List[Dict[str, Any]], merge: bool = False) -> List[Dict[str, str]]:
+    def write(self, todos: List[Dict[str, Any]], merge: bool = False) -> List[Dict[str, Any]]:
         """
         Write todos. Returns the full current list after writing.
 
@@ -63,6 +65,13 @@ class TodoStore:
                         status = str(t["status"]).strip().lower()
                         if status in VALID_STATUSES:
                             existing[item_id]["status"] = status
+                    for field in OPTIONAL_METADATA_FIELDS:
+                        if field in t:
+                            value = self._normalize_optional_field(field, t.get(field))
+                            if value is None:
+                                existing[item_id].pop(field, None)
+                            else:
+                                existing[item_id][field] = value
                 else:
                     # New item -- validate fully and append to end
                     validated = self._validate(t)
@@ -79,9 +88,15 @@ class TodoStore:
             self._items = rebuilt
         return self.read()
 
-    def read(self) -> List[Dict[str, str]]:
+    def read(self) -> List[Dict[str, Any]]:
         """Return a copy of the current list."""
-        return [item.copy() for item in self._items]
+        copied = []
+        for item in self._items:
+            clone = item.copy()
+            if isinstance(clone.get("dependencies"), list):
+                clone["dependencies"] = list(clone["dependencies"])
+            copied.append(clone)
+        return copied
 
     def has_items(self) -> bool:
         """Check if there are any items in the list."""
@@ -122,12 +137,12 @@ class TodoStore:
         return "\n".join(lines)
 
     @staticmethod
-    def _validate(item: Dict[str, Any]) -> Dict[str, str]:
+    def _validate(item: Dict[str, Any]) -> Dict[str, Any]:
         """
         Validate and normalize a todo item.
 
         Ensures required fields exist and status is valid.
-        Returns a clean dict with only {id, content, status}.
+        Returns a clean dict with todo fields plus optional orchestration metadata.
         """
         item_id = str(item.get("id", "")).strip()
         if not item_id:
@@ -141,7 +156,33 @@ class TodoStore:
         if status not in VALID_STATUSES:
             status = "pending"
 
-        return {"id": item_id, "content": content, "status": status}
+        validated: Dict[str, Any] = {"id": item_id, "content": content, "status": status}
+        for field in OPTIONAL_METADATA_FIELDS:
+            value = TodoStore._normalize_optional_field(field, item.get(field))
+            if value is not None:
+                validated[field] = value
+        return validated
+
+    @staticmethod
+    def _normalize_optional_field(field: str, value: Any) -> Any:
+        if field == "dependencies":
+            if value in (None, "", []):
+                return None
+            if not isinstance(value, list):
+                value = [value]
+            cleaned = [str(dep).strip() for dep in value if str(dep).strip()]
+            return cleaned or None
+
+        if field == "priority":
+            if value in (None, ""):
+                return None
+            normalized = str(value).strip().lower()
+            return normalized if normalized in VALID_PRIORITIES else None
+
+        if value in (None, ""):
+            return None
+        text = str(value).strip()
+        return text or None
 
     @staticmethod
     def _dedupe_by_id(todos: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -217,7 +258,9 @@ TODO_SCHEMA = {
         "- merge=false (default): replace the entire list with a fresh plan\n"
         "- merge=true: update existing items by id, add any new ones\n\n"
         "Each item: {id: string, content: string, "
-        "status: pending|in_progress|completed|cancelled}\n"
+        "status: pending|in_progress|completed|cancelled, "
+        "owner?: string, dependencies?: string[], artifact_path?: string, "
+        "run_id?: string, priority?: low|medium|high|urgent}\n"
         "List order is priority. Only ONE item in_progress at a time.\n"
         "Mark items completed immediately when done. If something fails, "
         "cancel it and add a revised item.\n\n"
@@ -234,19 +277,60 @@ TODO_SCHEMA = {
                     "properties": {
                         "id": {
                             "type": "string",
-                            "description": "Unique item identifier"
+                            "description": "Unique item identifier. Required for both replace and merge writes."
                         },
                         "content": {
                             "type": "string",
-                            "description": "Task description"
+                            "description": "Task description. Recommended for new/replacement items; optional for merge updates."
                         },
                         "status": {
                             "type": "string",
                             "enum": ["pending", "in_progress", "completed", "cancelled"],
-                            "description": "Current status"
+                            "description": "Current status. Recommended for new/replacement items; optional for merge updates."
+                        },
+                        "owner": {
+                            "description": "Optional owner/assignee label for orchestration (for example delegate:claude or parent). Omit or set null to clear on merge updates.",
+                            "anyOf": [
+                                {"type": "string"},
+                                {"type": "null"}
+                            ]
+                        },
+                        "dependencies": {
+                            "description": "Optional ordered list of todo ids this item depends on. Use [] or null to clear on merge updates.",
+                            "anyOf": [
+                                {
+                                    "type": "array",
+                                    "items": {"type": "string"}
+                                },
+                                {"type": "null"}
+                            ]
+                        },
+                        "artifact_path": {
+                            "description": "Optional path to a file or artifact produced by this item. Omit or set null to clear on merge updates.",
+                            "anyOf": [
+                                {"type": "string"},
+                                {"type": "null"}
+                            ]
+                        },
+                        "run_id": {
+                            "description": "Optional execution/run identifier associated with this item. Omit or set null to clear on merge updates.",
+                            "anyOf": [
+                                {"type": "string"},
+                                {"type": "null"}
+                            ]
+                        },
+                        "priority": {
+                            "description": "Optional relative priority for orchestration-aware todo items. Omit or set null to clear on merge updates.",
+                            "anyOf": [
+                                {
+                                    "type": "string",
+                                    "enum": ["low", "medium", "high", "urgent"]
+                                },
+                                {"type": "null"}
+                            ]
                         }
                     },
-                    "required": ["id", "content", "status"]
+                    "required": ["id"]
                 }
             },
             "merge": {

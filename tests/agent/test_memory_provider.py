@@ -6,6 +6,8 @@ from unittest.mock import MagicMock, patch
 
 from agent.memory_provider import MemoryProvider
 from agent.memory_manager import MemoryManager
+from agent.builtin_memory_provider import BuiltinMemoryProvider
+from tools.memory_tool import MemoryStore
 
 # ---------------------------------------------------------------------------
 # Concrete test provider
@@ -24,6 +26,7 @@ class FakeMemoryProvider(MemoryProvider):
         self.prefetch_queries = []
         self.queued_prefetches = []
         self.turn_starts = []
+        self.turn_start_kwargs = []
         self.session_end_called = False
         self.pre_compress_called = False
         self.memory_writes = []
@@ -64,8 +67,9 @@ class FakeMemoryProvider(MemoryProvider):
     def shutdown(self):
         self.shutdown_called = True
 
-    def on_turn_start(self, turn_number, message):
+    def on_turn_start(self, turn_number, message, **kwargs):
         self.turn_starts.append((turn_number, message))
+        self.turn_start_kwargs.append(kwargs)
 
     def on_session_end(self, messages):
         self.session_end_called = True
@@ -73,8 +77,8 @@ class FakeMemoryProvider(MemoryProvider):
     def on_pre_compress(self, messages):
         self.pre_compress_called = True
 
-    def on_memory_write(self, action, target, content):
-        self.memory_writes.append((action, target, content))
+    def on_memory_write(self, action, target, content, **kwargs):
+        self.memory_writes.append((action, target, content, kwargs))
 
 
 # ---------------------------------------------------------------------------
@@ -242,6 +246,37 @@ class TestMemoryManager:
         # p1 failed but p2 still synced
         assert p2.synced_turns == [("user", "assistant")]
 
+    def test_on_turn_start_notifies_all_providers_with_kwargs(self):
+        mgr = MemoryManager()
+        p1 = FakeMemoryProvider("builtin")
+        p2 = FakeMemoryProvider("external")
+        mgr.add_provider(p1)
+        mgr.add_provider(p2)
+
+        mgr.on_turn_start(
+            3,
+            "hello",
+            session_id="sess-123",
+            platform="weixin",
+            model="gpt-5.4",
+            tool_count=7,
+        )
+
+        assert p1.turn_starts == [(3, "hello")]
+        assert p2.turn_starts == [(3, "hello")]
+        assert p1.turn_start_kwargs == [{
+            "session_id": "sess-123",
+            "platform": "weixin",
+            "model": "gpt-5.4",
+            "tool_count": 7,
+        }]
+        assert p2.turn_start_kwargs == [{
+            "session_id": "sess-123",
+            "platform": "weixin",
+            "model": "gpt-5.4",
+            "tool_count": 7,
+        }]
+
     # -- Tool routing -------------------------------------------------------
 
     def test_tool_schemas_collected(self):
@@ -319,6 +354,19 @@ class TestMemoryManager:
         mgr.on_pre_compress([{"role": "user", "content": "old"}])
         assert p.pre_compress_called
 
+    def test_on_memory_write_forwards_structured_class(self):
+        mgr = MemoryManager()
+        builtin = FakeMemoryProvider("builtin")
+        external = FakeMemoryProvider("external")
+        mgr.add_provider(builtin)
+        mgr.add_provider(external)
+
+        mgr.on_memory_write("add", "user", "Prefers terse answers", entry_class="preference")
+        assert external.memory_writes == [
+            ("add", "user", "Prefers terse answers", {"entry_class": "preference"})
+        ]
+        assert builtin.memory_writes == []
+
     def test_shutdown_all_reverse_order(self):
         mgr = MemoryManager()
         order = []
@@ -370,6 +418,51 @@ class TestMemoryManager:
 
         result = mgr.build_system_prompt()
         assert result == "works fine"
+
+
+class TestBuiltinMemoryProvider:
+    def test_name_is_builtin(self):
+        provider = BuiltinMemoryProvider(MemoryStore())
+        assert provider.name == "builtin"
+
+    def test_system_prompt_block_includes_enabled_targets(self):
+        store = MemoryStore()
+        store._system_prompt_snapshot = {
+            "memory": "MEMORY BLOCK",
+            "user": "USER BLOCK",
+        }
+        provider = BuiltinMemoryProvider(
+            store,
+            memory_enabled=True,
+            user_profile_enabled=True,
+        )
+
+        result = provider.system_prompt_block()
+        assert "MEMORY BLOCK" in result
+        assert "USER BLOCK" in result
+
+    def test_system_prompt_block_respects_disabled_targets(self):
+        store = MemoryStore()
+        store._system_prompt_snapshot = {
+            "memory": "MEMORY BLOCK",
+            "user": "USER BLOCK",
+        }
+        provider = BuiltinMemoryProvider(
+            store,
+            memory_enabled=False,
+            user_profile_enabled=True,
+        )
+
+        result = provider.system_prompt_block()
+        assert result == "USER BLOCK"
+
+    def test_initialize_reloads_store_snapshot(self):
+        store = MagicMock()
+        provider = BuiltinMemoryProvider(store)
+
+        provider.initialize(session_id="sess-1", platform="cli")
+
+        store.load_from_disk.assert_called_once()
 
 
 class TestPluginMemoryDiscovery:

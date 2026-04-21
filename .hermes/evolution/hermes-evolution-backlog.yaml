@@ -1,0 +1,215 @@
+version: 1
+name: hermes-evolution-backlog
+updated_at: 2026-04-21T19:45:00+08:00
+source_projects:
+  high:
+    - claude-mem
+    - Agent Skills
+    - Archon
+    - Multica
+  medium:
+    - Andrej Karpathy Skills
+    - MarkItDown
+    - Rowboat
+tracks:
+  memory:
+    objective: Build a stronger automatic memory loop with capture, compression preservation, episodic summaries, and automatic recall.
+    items:
+      - id: A1
+        title: Wire pre-compression memory hints into compression summaries
+        priority: P0
+        status: done
+        inspiration:
+          - claude-mem
+        likely_files:
+          - run_agent.py
+          - agent/context_compressor.py
+        validation:
+          - Compression tests show provider memory hints shape the summary.
+      - id: A2
+        title: Wire on_turn_start memory hooks in the main loop
+        priority: P0
+        status: done
+        inspiration:
+          - claude-mem
+        likely_files:
+          - run_agent.py
+          - agent/memory_manager.py
+        validation:
+          - Providers receive turn-start hooks in integration tests.
+      - id: A3
+        title: Unify built-in memory behind MemoryManager
+        priority: P1
+        status: done
+        inspiration:
+          - claude-mem
+        likely_files:
+          - run_agent.py
+          - agent/memory_manager.py
+          - agent/memory_provider.py
+          - tools/memory_tool.py
+      - id: A4
+        title: Add local episodic summary storage from session history
+        priority: P1
+        status: done
+        inspiration:
+          - claude-mem
+        likely_files:
+          - hermes_state.py
+          - tools/session_search_tool.py
+          - agent/context_engine.py
+      - id: A5
+        title: Add automatic episodic recall before relevant turns
+        priority: P1
+        status: done
+        inspiration:
+          - claude-mem
+        likely_files:
+          - run_agent.py
+          - agent/memory_manager.py
+          - hermes_state.py
+      - id: A6
+        title: Split durable memory into structured classes
+        priority: P2
+        status: done
+        inspiration:
+          - claude-mem
+        likely_files:
+          - tools/memory_tool.py
+          - agent/memory_provider.py
+          - webapi/routes/memory.py
+  workflows:
+    objective: Move from prose-only skills and context files to structured workflows, repo-local policy, and durable workspace knowledge.
+    items:
+      - id: B1
+        title: Parse structured frontmatter in .hermes.md
+        priority: P0
+        status: done
+        inspiration:
+          - Archon
+          - Andrej Karpathy Skills
+        likely_files:
+          - agent/prompt_builder.py
+          - agent/context_references.py
+      - id: B2
+        title: Add declarative workflow metadata to skills
+        priority: P1
+        status: done
+        inspiration:
+          - Agent Skills
+          - Archon
+        likely_files:
+          - agent/skill_utils.py
+          - tools/skills_tool.py
+          - tools/skill_manager_tool.py
+      - id: B3
+        title: Support modular repo-local instruction packs
+        priority: P1
+        status: done
+        inspiration:
+          - Archon
+          - Andrej Karpathy Skills
+        likely_files:
+          - agent/subdirectory_hints.py
+          - agent/prompt_builder.py
+      - id: B4
+        title: Turn related_skills into operational chaining
+        priority: P2
+        status: done
+        inspiration:
+          - Agent Skills
+        likely_files:
+          - agent/skill_commands.py
+          - tools/skills_tool.py
+      - id: B5
+        title: Enforce stronger skill authoring and linting
+        priority: P2
+        status: done
+        inspiration:
+          - Agent Skills
+          - Andrej Karpathy Skills
+        likely_files:
+          - tools/skill_manager_tool.py
+          - website/docs/developer-guide/creating-skills.md
+      - id: B6
+        title: Add first-class workspace knowledge-base primitive
+        priority: P2
+        status: done
+        inspiration:
+          - Andrej Karpathy Skills
+          - Agent Skills
+        likely_files:
+          - agent/context_references.py
+          - agent/prompt_builder.py
+  orchestration:
+    objective: Make delegated work, todos, cron runs, and document attachments first-class and inspectable.
+    items:
+      - id: C1
+        title: Build reusable document ingest module
+        priority: P1
+        status: done
+        inspiration:
+          - MarkItDown
+        likely_files:
+          - tools/document_ingest.py
+          - gateway/run.py
+      - id: C2
+        title: Upgrade attachments to structured objects
+        priority: P1
+        status: done
+        inspiration:
+          - MarkItDown
+        likely_files:
+          - gateway/platforms/base.py
+          - gateway/platforms/telegram.py
+          - gateway/platforms/slack.py
+          - gateway/platforms/email.py
+          - gateway/platforms/weixin.py
+      - id: C3
+        title: Add gateway-side document enrichment
+        priority: P1
+        status: done
+        inspiration:
+          - MarkItDown
+        likely_files:
+          - gateway/run.py
+      - id: C4
+        title: Create unified task and run status surface
+        priority: P1
+        status: done
+        inspiration:
+          - Multica
+          - Rowboat
+        likely_files:
+          - gateway/run.py
+          - run_agent.py
+          - tools/todo_tool.py
+          - tools/delegate_tool.py
+      - id: C5
+        title: Extend todo items with orchestration metadata
+        priority: P2
+        status: done
+        inspiration:
+          - Multica
+        likely_files:
+          - tools/todo_tool.py
+      - id: C6
+        title: Add cron fan-out and delegated execution mode
+        priority: P2
+        status: done
+        inspiration:
+          - Multica
+        likely_files:
+          - cron/scheduler.py
+          - tools/cronjob_tools.py
+phases:
+  - name: phase-1-foundation
+    includes: [A1, A2, B1, C1, C2, C3]
+  - name: phase-2-structured-evolution
+    includes: [A3, A4, A5, B2, B3, C4]
+  - name: phase-3-operational-maturity
+    includes: [A6, B4, B5, B6, C5, C6]
+reporting_rules:
+  - Always separate external learnings, roadmap impact, and next concrete implementation tasks.
+  - Do not mutate code during cron research/audit runs.
+  - When an item appears implemented, mark it done with supporting evidence and note any residual gaps.

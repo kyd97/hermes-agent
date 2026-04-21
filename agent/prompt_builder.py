@@ -87,6 +87,16 @@ def _find_git_root(start: Path) -> Optional[Path]:
 
 
 _HERMES_MD_NAMES = (".hermes.md", "HERMES.md")
+_WORKSPACE_KB_DIRS = (
+    (".hermes", "knowledge"),
+    ("HERMES.kb",),
+)
+_WORKSPACE_KB_EXTENSIONS = (".md", ".mdc", ".txt")
+_INSTRUCTION_PACK_DIRS = (
+    (".hermes", "instructions"),
+    ("HERMES.d",),
+)
+_INSTRUCTION_PACK_EXTENSIONS = (".md", ".mdc", ".txt")
 
 
 def _find_hermes_md(cwd: Path) -> Optional[Path]:
@@ -110,6 +120,18 @@ def _find_hermes_md(cwd: Path) -> Optional[Path]:
     return None
 
 
+def _iter_context_directories(cwd: Path) -> list[Path]:
+    """Return cwd + ancestors up to the git root for context discovery."""
+    stop_at = _find_git_root(cwd)
+    current = cwd.resolve()
+    directories: list[Path] = []
+    for directory in [current, *current.parents]:
+        directories.append(directory)
+        if stop_at and directory == stop_at:
+            break
+    return directories
+
+
 def _strip_yaml_frontmatter(content: str) -> str:
     """Remove optional YAML frontmatter (``---`` delimited) from *content*.
 
@@ -118,13 +140,92 @@ def _strip_yaml_frontmatter(content: str) -> str:
     strip it so only the human-readable markdown body is injected into the
     system prompt.
     """
-    if content.startswith("---"):
-        end = content.find("\n---", 3)
-        if end != -1:
-            # Skip past the closing --- and any trailing newline
-            body = content[end + 4:].lstrip("\n")
-            return body if body else content
-    return content
+    _, body = parse_frontmatter(content)
+    cleaned = body.lstrip("\n")
+    return cleaned if cleaned else content
+
+
+def _format_hermes_frontmatter_summary(frontmatter: dict) -> str:
+    """Render supported .hermes.md frontmatter keys into a short text block."""
+    if not isinstance(frontmatter, dict) or not frontmatter:
+        return ""
+
+    lines = []
+
+    preferred_skills = frontmatter.get("preferred_skills")
+    if isinstance(preferred_skills, str):
+        preferred_skills = [preferred_skills]
+    if isinstance(preferred_skills, list):
+        skills = [str(item).strip() for item in preferred_skills if str(item).strip()]
+        if skills:
+            lines.append(f"Preferred skills: {', '.join(skills)}")
+
+    verification_steps = frontmatter.get("verification_steps")
+    if isinstance(verification_steps, str):
+        verification_steps = [verification_steps]
+    if isinstance(verification_steps, list):
+        steps = [str(item).strip() for item in verification_steps if str(item).strip()]
+        if steps:
+            lines.append("Verification steps:")
+            lines.extend(f"- {step}" for step in steps)
+
+    workflow = frontmatter.get("workflow")
+    if isinstance(workflow, str) and workflow.strip():
+        lines.append(f"Workflow: {workflow.strip()}")
+    elif isinstance(workflow, dict):
+        workflow_name = str(workflow.get("name", "")).strip()
+        if workflow_name:
+            lines.append(f"Workflow: {workflow_name}")
+        workflow_steps_value = workflow.get("steps")
+        if isinstance(workflow_steps_value, str):
+            workflow_steps_value = [workflow_steps_value]
+        if isinstance(workflow_steps_value, list):
+            steps = [str(item).strip() for item in workflow_steps_value if str(item).strip()]
+            if steps:
+                lines.append(f"Workflow steps: {'; '.join(steps)}")
+
+    workflow_steps = frontmatter.get("workflow_steps")
+    if isinstance(workflow_steps, str):
+        workflow_steps = [workflow_steps]
+    if isinstance(workflow_steps, list):
+        steps = [str(item).strip() for item in workflow_steps if str(item).strip()]
+        if steps:
+            lines.append(f"Workflow steps: {'; '.join(steps)}")
+
+    deliverables = frontmatter.get("deliverables")
+    if isinstance(deliverables, str):
+        deliverables = [deliverables]
+    if isinstance(deliverables, list):
+        outputs = [str(item).strip() for item in deliverables if str(item).strip()]
+        if outputs:
+            lines.append(f"Deliverables: {'; '.join(outputs)}")
+
+    policy = frontmatter.get("policy")
+    if isinstance(policy, str) and policy.strip():
+        lines.append(f"Policy: {policy.strip()}")
+    elif isinstance(policy, dict):
+        policy_name = str(policy.get("name", "")).strip()
+        if policy_name:
+            lines.append(f"Policy: {policy_name}")
+        policy_checks_value = policy.get("checks")
+        if isinstance(policy_checks_value, str):
+            policy_checks_value = [policy_checks_value]
+        if isinstance(policy_checks_value, list):
+            checks = [str(item).strip() for item in policy_checks_value if str(item).strip()]
+            if checks:
+                lines.append(f"Policy checks: {'; '.join(checks)}")
+
+    policy_checks = frontmatter.get("policy_checks")
+    if isinstance(policy_checks, str):
+        policy_checks = [policy_checks]
+    if isinstance(policy_checks, list):
+        checks = [str(item).strip() for item in policy_checks if str(item).strip()]
+        if checks:
+            lines.append(f"Policy checks: {'; '.join(checks)}")
+
+    if not lines:
+        return ""
+    return "### Structured Hermes config\n\n" + "\n".join(lines)
 
 
 # =========================================================================
@@ -931,21 +1032,147 @@ def _load_hermes_md(cwd_path: Path) -> str:
     if not hermes_md_path:
         return ""
     try:
-        content = hermes_md_path.read_text(encoding="utf-8").strip()
-        if not content:
+        raw_content = hermes_md_path.read_text(encoding="utf-8")
+        if not raw_content.strip():
             return ""
-        content = _strip_yaml_frontmatter(content)
+        frontmatter, body = parse_frontmatter(raw_content)
+        content = body.lstrip("\n") if body is not None else ""
+        frontmatter_summary = _format_hermes_frontmatter_summary(frontmatter)
         rel = hermes_md_path.name
         try:
             rel = str(hermes_md_path.relative_to(cwd_path))
         except ValueError:
             pass
-        content = _scan_context_content(content, rel)
-        result = f"## {rel}\n\n{content}"
+        combined = "\n\n".join(part for part in [frontmatter_summary, content] if part)
+        combined = _scan_context_content(combined, rel)
+        result = f"## {rel}\n\n{combined}"
         return _truncate_content(result, ".hermes.md")
     except Exception as e:
         logger.debug("Could not read %s: %s", hermes_md_path, e)
         return ""
+
+
+def _load_instruction_packs(cwd_path: Path) -> str:
+    """Load modular repo-local instruction packs from supported directories."""
+    pack_sections = []
+    seen_files: set[Path] = set()
+
+    for directory in reversed(_iter_context_directories(cwd_path)):
+        for pack_dir_parts in _INSTRUCTION_PACK_DIRS:
+            pack_dir = directory.joinpath(*pack_dir_parts)
+            try:
+                if not pack_dir.is_dir():
+                    continue
+            except OSError:
+                continue
+            try:
+                children = sorted(
+                    [
+                        child for child in pack_dir.iterdir()
+                        if child.is_file() and child.suffix.lower() in _INSTRUCTION_PACK_EXTENSIONS
+                    ],
+                    key=lambda p: p.name,
+                )
+            except Exception as e:
+                logger.debug("Could not scan instruction pack dir %s: %s", pack_dir, e)
+                continue
+
+            for child in children:
+                try:
+                    resolved = child.resolve()
+                except Exception:
+                    resolved = child
+                if resolved in seen_files:
+                    continue
+                seen_files.add(resolved)
+                try:
+                    raw_content = child.read_text(encoding="utf-8")
+                    if not raw_content.strip():
+                        continue
+                    frontmatter, body = parse_frontmatter(raw_content)
+                    body_text = body.lstrip("\n") if body is not None else ""
+                    frontmatter_summary = _format_hermes_frontmatter_summary(frontmatter)
+                    combined = "\n\n".join(
+                        part for part in [frontmatter_summary, body_text] if part
+                    ) or raw_content.strip()
+                    rel = str(child.relative_to(directory))
+                    combined = _scan_context_content(combined, rel)
+                    rendered = f"### {rel}\n\n{combined}"
+                    pack_sections.append(_truncate_content(rendered, child.name))
+                except Exception as e:
+                    logger.debug("Could not read instruction pack %s: %s", child, e)
+
+    if not pack_sections:
+        return ""
+    return "## Project instruction packs\n\n" + "\n\n".join(pack_sections)
+
+
+def _load_workspace_knowledge_base(cwd_path: Path) -> str:
+    """Load a compact index of repo-local workspace knowledge-base entries."""
+    entries_by_label: dict[str, str] = {}
+    seen_files: set[Path] = set()
+
+    for directory in _iter_context_directories(cwd_path):
+        for kb_dir_parts in _WORKSPACE_KB_DIRS:
+            kb_dir = directory.joinpath(*kb_dir_parts)
+            try:
+                if not kb_dir.is_dir():
+                    continue
+            except OSError:
+                continue
+            try:
+                children = sorted(
+                    [
+                        child for child in kb_dir.rglob("*")
+                        if child.is_file() and child.suffix.lower() in _WORKSPACE_KB_EXTENSIONS
+                    ],
+                    key=lambda p: str(p.relative_to(kb_dir)),
+                )
+            except Exception as e:
+                logger.debug("Could not scan workspace knowledge dir %s: %s", kb_dir, e)
+                continue
+
+            for child in children:
+                try:
+                    resolved = child.resolve()
+                except Exception:
+                    resolved = child
+                if resolved in seen_files:
+                    continue
+                seen_files.add(resolved)
+                try:
+                    raw_content = child.read_text(encoding="utf-8")
+                    if not raw_content.strip():
+                        continue
+                    frontmatter, body = parse_frontmatter(raw_content)
+                    description = str(frontmatter.get("description") or "").strip()
+                    if not description:
+                        body_text = (body or raw_content).strip()
+                        for line in body_text.splitlines():
+                            stripped = line.strip()
+                            if stripped and not stripped.startswith("#"):
+                                description = stripped
+                                break
+                    rel = str(child.relative_to(kb_dir))
+                    entry_label = rel.removesuffix(child.suffix)
+                    if entry_label in entries_by_label:
+                        continue
+                    description = _scan_context_content(description, rel) if description else ""
+                    if description:
+                        entries_by_label[entry_label] = f"- {entry_label} — {description}"
+                    else:
+                        entries_by_label[entry_label] = f"- {entry_label}"
+                except Exception as e:
+                    logger.debug("Could not read workspace knowledge entry %s: %s", child, e)
+
+    if not entries_by_label:
+        return ""
+    return (
+        "## Workspace knowledge base\n\n"
+        "These repo-local knowledge entries are available as reusable background context. "
+        "Reference them inline with @kb:<entry> when relevant.\n\n"
+        + "\n".join(entries_by_label[key] for key in sorted(entries_by_label))
+    )
 
 
 def _load_agents_md(cwd_path: Path) -> str:
@@ -1013,11 +1240,15 @@ def _load_cursorrules(cwd_path: Path) -> str:
 def build_context_files_prompt(cwd: Optional[str] = None, skip_soul: bool = False) -> str:
     """Discover and load context files for the system prompt.
 
-    Priority (first found wins — only ONE project context type is loaded):
-      1. .hermes.md / HERMES.md  (walk to git root)
-      2. AGENTS.md / agents.md   (cwd only)
-      3. CLAUDE.md / claude.md   (cwd only)
-      4. .cursorrules / .cursor/rules/*.mdc  (cwd only)
+    Project context sources:
+      1. .hermes.md / HERMES.md  (walk to git root; nearest wins)
+      2. Modular instruction packs from .hermes/instructions/ or HERMES.d/
+         (load all discovered packs from repo root → cwd)
+      3. Workspace knowledge base from .hermes/knowledge/ or HERMES.kb/
+         (load a compact entry index from repo root → cwd)
+      4. AGENTS.md / agents.md   (cwd only)
+      5. CLAUDE.md / claude.md   (cwd only)
+      6. .cursorrules / .cursor/rules/*.mdc  (cwd only)
 
     SOUL.md from HERMES_HOME is independent and always included when present.
     Each context source is capped at 20,000 chars.
@@ -1031,15 +1262,25 @@ def build_context_files_prompt(cwd: Optional[str] = None, skip_soul: bool = Fals
     cwd_path = Path(cwd).resolve()
     sections = []
 
-    # Priority-based project context: first match wins
-    project_context = (
-        _load_hermes_md(cwd_path)
-        or _load_agents_md(cwd_path)
-        or _load_claude_md(cwd_path)
-        or _load_cursorrules(cwd_path)
-    )
-    if project_context:
-        sections.append(project_context)
+    hermes_md = _load_hermes_md(cwd_path)
+    instruction_packs = _load_instruction_packs(cwd_path)
+    workspace_knowledge = _load_workspace_knowledge_base(cwd_path)
+    fallback_project_context = ""
+    if not hermes_md and not instruction_packs:
+        fallback_project_context = (
+            _load_agents_md(cwd_path)
+            or _load_claude_md(cwd_path)
+            or _load_cursorrules(cwd_path)
+        )
+
+    if hermes_md:
+        sections.append(hermes_md)
+    if instruction_packs:
+        sections.append(instruction_packs)
+    if workspace_knowledge:
+        sections.append(workspace_knowledge)
+    if fallback_project_context:
+        sections.append(fallback_project_context)
 
     # SOUL.md from HERMES_HOME only — skip when already loaded as identity
     if not skip_soul:

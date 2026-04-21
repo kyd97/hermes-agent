@@ -373,6 +373,26 @@ class TestIncomingDocumentHandling:
         assert len(msg_event.media_urls) == 1
         assert os.path.exists(msg_event.media_urls[0])
         assert msg_event.media_types == ["application/pdf"]
+        assert msg_event.attachments[0].filename == "report.pdf"
+        assert msg_event.attachments[0].media_type == "application/pdf"
+
+    @pytest.mark.asyncio
+    async def test_audio_attachment_keeps_audio_kind(self, adapter):
+        with patch.object(adapter, "_download_slack_file", new_callable=AsyncMock) as dl:
+            dl.return_value = "/tmp/cached_note.mp3"
+            event = self._make_event(files=[{
+                "mimetype": "audio/mpeg",
+                "name": "note.mp3",
+                "url_private_download": "https://files.slack.com/note.mp3",
+                "size": 1024,
+            }])
+            await adapter._handle_slack_message(event)
+
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert msg_event.message_type == MessageType.VOICE
+        assert msg_event.attachments[0].filename == "note.mp3"
+        assert msg_event.attachments[0].media_type == "audio/mpeg"
+        assert msg_event.attachments[0].kind == "audio"
 
     @pytest.mark.asyncio
     async def test_txt_document_injects_content(self, adapter):

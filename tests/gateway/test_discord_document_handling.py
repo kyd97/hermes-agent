@@ -149,7 +149,11 @@ def _mock_aiohttp_download(raw_bytes: bytes):
     session.__aenter__ = AsyncMock(return_value=session)
     session.__aexit__ = AsyncMock(return_value=False)
 
-    return patch("aiohttp.ClientSession", return_value=session)
+    fake_aiohttp = SimpleNamespace(
+        ClientSession=MagicMock(return_value=session),
+        ClientTimeout=lambda total: SimpleNamespace(total=total),
+    )
+    return patch.dict(sys.modules, {"aiohttp": fake_aiohttp})
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +176,8 @@ class TestIncomingDocumentHandling:
         assert len(event.media_urls) == 1
         assert os.path.exists(event.media_urls[0])
         assert event.media_types == ["application/pdf"]
+        assert event.attachments[0].filename == "report.pdf"
+        assert event.attachments[0].media_type == "application/pdf"
         assert "[Content of" not in (event.text or "")
 
     @pytest.mark.asyncio
@@ -288,7 +294,11 @@ class TestIncomingDocumentHandling:
         session.__aenter__ = AsyncMock(return_value=session)
         session.__aexit__ = AsyncMock(return_value=False)
 
-        with patch("aiohttp.ClientSession", return_value=session):
+        fake_aiohttp = SimpleNamespace(
+            ClientSession=MagicMock(return_value=session),
+            ClientTimeout=lambda total: SimpleNamespace(total=total),
+        )
+        with patch.dict(sys.modules, {"aiohttp": fake_aiohttp}):
             msg = make_message([
                 make_attachment(filename="report.pdf", content_type="application/pdf")
             ])
@@ -314,6 +324,9 @@ class TestIncomingDocumentHandling:
         event = adapter.handle_message.call_args[0][0]
         assert len(event.media_urls) == 1
         assert os.path.exists(event.media_urls[0])
+        assert event.media_types == ["text/plain"]
+        assert event.attachments[0].filename == "big.txt"
+        assert event.attachments[0].media_type == "text/plain"
         assert "[Content of" not in (event.text or "")
 
     @pytest.mark.asyncio
@@ -349,7 +362,11 @@ class TestIncomingDocumentHandling:
 
             return FakeSession()
 
-        with patch("aiohttp.ClientSession", return_value=make_session([content1, content2])):
+        fake_aiohttp = SimpleNamespace(
+            ClientSession=MagicMock(return_value=make_session([content1, content2])),
+            ClientTimeout=lambda total: SimpleNamespace(total=total),
+        )
+        with patch.dict(sys.modules, {"aiohttp": fake_aiohttp}):
             msg = make_message(
                 attachments=[
                     make_attachment(filename="file1.txt", content_type="text/plain"),

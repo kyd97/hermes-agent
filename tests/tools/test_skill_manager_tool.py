@@ -38,7 +38,7 @@ def _skill_dir(tmp_path):
 
 VALID_SKILL_CONTENT = """\
 ---
-name: test-skill
+name: my-skill
 description: A test skill for unit testing.
 ---
 
@@ -49,7 +49,7 @@ Step 1: Do the thing.
 
 VALID_SKILL_CONTENT_2 = """\
 ---
-name: test-skill
+name: my-skill
 description: Updated description.
 ---
 
@@ -140,6 +140,50 @@ class TestValidateFrontmatter:
         content = "---\nname: test\n---\n\nBody.\n"
         assert _validate_frontmatter(content) == "Frontmatter must include 'description' field."
 
+    def test_null_description_rejected(self):
+        content = "---\nname: test\ndescription: null\n---\n\nBody.\n"
+        assert _validate_frontmatter(content) == "Frontmatter 'description' must not be empty."
+
+    def test_frontmatter_name_must_match_expected_name(self):
+        content = "---\nname: different-skill\ndescription: desc\n---\n\nBody.\n"
+        assert _validate_frontmatter(content, expected_name="test-skill") == (
+            "Frontmatter name 'different-skill' must match the skill name 'test-skill'."
+        )
+
+    def test_invalid_related_skill_name_rejected(self):
+        content = (
+            "---\n"
+            "name: test-skill\n"
+            "description: desc\n"
+            "metadata:\n"
+            "  hermes:\n"
+            "    related_skills: ['Bad Skill']\n"
+            "---\n\nBody.\n"
+        )
+        assert "Invalid related skill name 'Bad Skill'" in _validate_frontmatter(content)
+
+    def test_lint_ignores_section_headings_inside_code_blocks(self, tmp_path):
+        code_only = """\
+---
+name: my-skill
+description: desc
+---
+
+# Skill
+
+```markdown
+## When to Use
+## Verification
+## Pitfalls
+## Procedure
+```
+"""
+        with _skill_dir(tmp_path):
+            result = _create_skill("my-skill", code_only)
+        assert result["success"] is True
+        assert any("When to Use" in warning for warning in result["lint_warnings"])
+        assert any("Verification" in warning for warning in result["lint_warnings"])
+
     def test_no_body_after_frontmatter(self):
         content = "---\nname: test\ndescription: desc\n---\n"
         assert _validate_frontmatter(content) == "SKILL.md must have content after the frontmatter (instructions, procedures, etc.)."
@@ -195,6 +239,7 @@ class TestCreateSkill:
             result = _create_skill("my-skill", VALID_SKILL_CONTENT)
         assert result["success"] is True
         assert (tmp_path / "my-skill" / "SKILL.md").exists()
+        assert "lint_warnings" in result
 
     def test_create_with_category(self, tmp_path):
         with _skill_dir(tmp_path):
@@ -209,6 +254,20 @@ class TestCreateSkill:
             result = _create_skill("my-skill", VALID_SKILL_CONTENT)
         assert result["success"] is False
         assert "already exists" in result["error"]
+
+    def test_create_rejects_frontmatter_name_mismatch(self, tmp_path):
+        mismatched = VALID_SKILL_CONTENT.replace("name: my-skill", "name: other-skill")
+        with _skill_dir(tmp_path):
+            result = _create_skill("my-skill", mismatched)
+        assert result["success"] is False
+        assert "must match the skill name 'my-skill'" in result["error"]
+
+    def test_create_emits_lint_warnings_for_missing_sections(self, tmp_path):
+        with _skill_dir(tmp_path):
+            result = _create_skill("my-skill", VALID_SKILL_CONTENT)
+        assert result["success"] is True
+        assert any("When to Use" in warning for warning in result["lint_warnings"])
+        assert any("Verification" in warning for warning in result["lint_warnings"])
 
     def test_create_invalid_name(self, tmp_path):
         with _skill_dir(tmp_path):
@@ -252,6 +311,7 @@ class TestEditSkill:
             _create_skill("my-skill", VALID_SKILL_CONTENT)
             result = _edit_skill("my-skill", VALID_SKILL_CONTENT_2)
         assert result["success"] is True
+        assert "lint_warnings" in result
         content = (tmp_path / "my-skill" / "SKILL.md").read_text()
         assert "Updated description" in content
 
@@ -269,6 +329,16 @@ class TestEditSkill:
         # Original content should be preserved
         content = (tmp_path / "my-skill" / "SKILL.md").read_text()
         assert "A test skill" in content
+
+    def test_edit_rejects_frontmatter_name_mismatch(self, tmp_path):
+        with _skill_dir(tmp_path):
+            _create_skill("my-skill", VALID_SKILL_CONTENT)
+            result = _edit_skill(
+                "my-skill",
+                VALID_SKILL_CONTENT_2.replace("name: my-skill", "name: different-skill"),
+            )
+        assert result["success"] is False
+        assert "must match the skill name 'my-skill'" in result["error"]
 
 
 class TestPatchSkill:
@@ -290,7 +360,7 @@ class TestPatchSkill:
     def test_patch_ambiguous_match_rejected(self, tmp_path):
         content = """\
 ---
-name: test-skill
+name: my-skill
 description: A test skill.
 ---
 
@@ -307,7 +377,7 @@ word word
     def test_patch_replace_all(self, tmp_path):
         content = """\
 ---
-name: test-skill
+name: my-skill
 description: A test skill.
 ---
 
@@ -350,6 +420,44 @@ word word
         assert result["success"] is False
         assert "escapes" in result["error"].lower()
         assert outside_file.read_text() == "old text here"
+
+    def test_patch_skill_surfaces_lint_warnings(self, tmp_path):
+        with _skill_dir(tmp_path):
+            _create_skill("my-skill", VALID_SKILL_CONTENT)
+            result = _patch_skill(
+                "my-skill",
+                "Step 1: Do the thing.",
+                "## When to Use\nOnly for testing.\n\nStep 1: Do the thing.",
+            )
+        assert result["success"] is True
+        assert "lint_warnings" in result
+
+    def test_patch_skill_returns_empty_lint_warnings_when_clean(self, tmp_path):
+        clean_content = """\
+---
+name: my-skill
+description: Clean skill.
+---
+
+# Clean Skill
+
+## When to Use
+Use when testing.
+
+## Quick Reference
+- Run the command.
+
+## Pitfalls
+Watch for drift.
+
+## Verification
+Run pytest.
+"""
+        with _skill_dir(tmp_path):
+            _create_skill("my-skill", clean_content)
+            result = _patch_skill("my-skill", "Run pytest.", "Run pytest -q.")
+        assert result["success"] is True
+        assert result["lint_warnings"] == []
 
 
 class TestDeleteSkill:
@@ -481,6 +589,19 @@ class TestSkillManageDispatcher:
 
     def test_full_create_via_dispatcher(self, tmp_path):
         with _skill_dir(tmp_path):
-            raw = skill_manage(action="create", name="test-skill", content=VALID_SKILL_CONTENT)
+            raw = skill_manage(action="create", name="my-skill", content=VALID_SKILL_CONTENT)
         result = json.loads(raw)
         assert result["success"] is True
+
+    def test_dispatcher_logs_skill_lifecycle_event(self, tmp_path, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            "agent.skill_analytics.log_skill_event",
+            lambda **kwargs: calls.append(kwargs),
+        )
+        with _skill_dir(tmp_path):
+            raw = skill_manage(action="create", name="my-skill", content=VALID_SKILL_CONTENT)
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert calls[0]["skill_name"] == "my-skill"
+        assert calls[0]["event_type"] == "installed"

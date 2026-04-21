@@ -255,6 +255,7 @@ class ContextCompressor(ContextEngine):
         self._previous_summary = None
         self._last_compression_savings_pct = 100.0
         self._ineffective_compression_count = 0
+        self._last_generated_summary = None
 
     def update_model(
         self,
@@ -347,6 +348,7 @@ class ContextCompressor(ContextEngine):
         # Anti-thrashing: track whether last compression was effective
         self._last_compression_savings_pct: float = 100.0
         self._ineffective_compression_count: int = 0
+        self._last_generated_summary: Optional[str] = None
         self._summary_failure_cooldown_until: float = 0.0
 
     def update_from_response(self, usage: Dict[str, Any]):
@@ -600,7 +602,12 @@ class ContextCompressor(ContextEngine):
 
         return "\n\n".join(parts)
 
-    def _generate_summary(self, turns_to_summarize: List[Dict[str, Any]], focus_topic: str = None) -> Optional[str]:
+    def _generate_summary(
+        self,
+        turns_to_summarize: List[Dict[str, Any]],
+        focus_topic: str = None,
+        memory_hints: str = "",
+    ) -> Optional[str]:
         """Generate a structured summary of conversation turns.
 
         Uses a structured template (Goal, Progress, Decisions, Resolved/Pending
@@ -743,6 +750,14 @@ Use this exact structure:
 FOCUS TOPIC: "{focus_topic}"
 The user has requested that this compaction PRIORITISE preserving all information related to the focus topic above. For content related to "{focus_topic}", include full detail — exact values, file paths, command outputs, error messages, and decisions. For content NOT related to the focus topic, summarise more aggressively (brief one-liners or omit if truly irrelevant). The focus topic sections should receive roughly 60-70% of the summary token budget. Even for the focus topic, NEVER preserve API keys, tokens, passwords, or credentials — use [REDACTED]."""
 
+        if memory_hints and memory_hints.strip():
+            prompt += f"""
+
+MEMORY PRESERVATION HINTS:
+{memory_hints.strip()}
+
+Treat these hints as high-priority preservation guidance for the summary. If any hinted detail appears in the turns being compacted, preserve it explicitly in the most relevant section above."""
+
         try:
             call_kwargs = {
                 "task": "compression",
@@ -829,6 +844,15 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                 text = text[len(prefix):].lstrip()
                 break
         return f"{SUMMARY_PREFIX}\n{text}" if text else SUMMARY_PREFIX
+
+    @staticmethod
+    def strip_summary_prefix(summary: str) -> str:
+        """Remove compaction wrapper text before reusing a summary elsewhere."""
+        text = (summary or "").strip()
+        for prefix in (LEGACY_SUMMARY_PREFIX, SUMMARY_PREFIX):
+            if text.startswith(prefix):
+                return text[len(prefix):].lstrip()
+        return text
 
     # ------------------------------------------------------------------
     # Tool-call / tool-result pair integrity helpers
@@ -1062,7 +1086,13 @@ The user has requested that this compaction PRIORITISE preserving all informatio
     # Main compression entry point
     # ------------------------------------------------------------------
 
-    def compress(self, messages: List[Dict[str, Any]], current_tokens: int = None, focus_topic: str = None) -> List[Dict[str, Any]]:
+    def compress(
+        self,
+        messages: List[Dict[str, Any]],
+        current_tokens: int = None,
+        focus_topic: str = None,
+        memory_hints: str = "",
+    ) -> List[Dict[str, Any]]:
         """Compress conversation messages by summarizing middle turns.
 
         Algorithm:
@@ -1082,6 +1112,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                 everything else.  Inspired by Claude Code's ``/compact``.
         """
         n_messages = len(messages)
+        self._last_generated_summary = None
         # Only need head + 3 tail messages minimum (token budget decides the real tail size)
         _min_for_compress = self.protect_first_n + 3 + 1
         if n_messages <= _min_for_compress:
@@ -1137,7 +1168,11 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             )
 
         # Phase 3: Generate structured summary
-        summary = self._generate_summary(turns_to_summarize, focus_topic=focus_topic)
+        summary = self._generate_summary(
+            turns_to_summarize,
+            focus_topic=focus_topic,
+            memory_hints=memory_hints,
+        )
 
         # Phase 4: Assemble compressed message list
         compressed = []
@@ -1163,6 +1198,8 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                 f"turns contained earlier work in this session. Continue based on the "
                 f"recent messages below and the current state of any files or resources."
             )
+
+        self._last_generated_summary = summary
 
         _merge_summary_into_tail = False
         last_head_role = messages[compress_start - 1].get("role", "user") if compress_start > 0 else "user"

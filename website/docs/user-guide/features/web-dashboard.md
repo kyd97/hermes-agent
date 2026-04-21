@@ -132,6 +132,7 @@ Usage and cost analytics computed from session history. Select a time period (7,
 - **Daily token chart** — stacked bar chart showing input and output token usage per day, with hover tooltips showing breakdowns and cost
 - **Daily breakdown table** — date, session count, input tokens, output tokens, cache hit rate, and cost for each day
 - **Per-model breakdown** — table showing each model used, its session count, token usage, and estimated cost
+- **Skill analytics** — active skills, total views, invocations, preloads, unused skills, top skills, and top categories for the selected period
 
 ### Cron
 
@@ -147,10 +148,15 @@ Create and manage scheduled cron jobs that run agent prompts on a recurring sche
 
 Browse, search, and toggle skills and toolsets. Skills are loaded from `~/.hermes/skills/` and grouped by category.
 
-- **Search** — filter skills and toolsets by name, description, or category
+- **Search + sorting** — filter skills by name/category and sort by name, most-used, recently-used, or unused-only
 - **Category filter** — click category pills to narrow the list (e.g. MLOps, MCP, Red Teaming, AI)
 - **Toggle** — enable or disable individual skills with a switch. Changes take effect on the next session.
+- **Usage stats** — see per-skill views, invocations, preloads, installs, updates, session counts, and last-used timestamps so you can identify high-value and dead-weight skills
+- **Details panel** — open a skill to inspect trigger breakdowns and recent lifecycle events without leaving the dashboard
+- **Cleanup insights** — dead-skill and duplicate-skill candidates are surfaced directly in the dashboard
+- **Historical backfill** — run a one-click backfill that infers older skill events from stored session messages so new analytics are useful immediately
 - **Toolsets** — a separate section shows built-in toolsets (file operations, web browsing, etc.) with their active/inactive status, setup requirements, and list of included tools
+
 
 :::warning Security
 The web dashboard reads and writes your `.env` file, which contains API keys and secrets. It binds to `127.0.0.1` by default — only accessible from your local machine. If you bind to `0.0.0.0`, anyone on your network can view and modify your credentials. The dashboard has no authentication of its own.
@@ -231,6 +237,10 @@ Returns log lines. Query parameters: `file` (agent/errors/gateway), `lines` (cou
 
 Returns token usage, cost, and session analytics. Query parameter: `days` (default 30). Response includes daily breakdowns and per-model aggregates.
 
+### GET /api/analytics/skills
+
+Returns skill analytics for the selected period. Query parameter: `days` (default 30). Response includes totals, daily skill activity, top skills, and top categories.
+
 ### GET /api/cron/jobs
 
 Returns all configured cron jobs with their state, schedule, and run history.
@@ -258,6 +268,22 @@ Deletes a cron job.
 ### GET /api/skills
 
 Returns all skills with their name, description, category, and enabled status.
+
+### GET /api/skills/stats
+
+Returns installed skills enriched with usage counters for the selected period, including views, invocations, preloads, installs, update/delete lifecycle counts, unique session counts, and last-used timestamps.
+
+### GET /api/skills/{skill_name}/stats
+
+Returns detailed analytics for a single skill, including summary counters, daily activity, trigger breakdowns, and recent lifecycle events.
+
+### GET /api/skills/cleanup
+
+Returns cleanup recommendations for the selected period, including dead-skill candidates (no recent activity) and duplicate-skill candidates based on name/description similarity.
+
+### POST /api/skills/backfill
+
+Runs a historical backfill pass that scans stored session messages for older skill invocation markers and inserts inferred events into `skill_events`.
 
 ### PUT /api/skills/toggle
 

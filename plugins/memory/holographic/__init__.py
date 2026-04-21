@@ -240,7 +240,7 @@ class HolographicMemoryProvider(MemoryProvider):
             return
         self._auto_extract_facts(messages)
 
-    def on_memory_write(self, action: str, target: str, content: str) -> None:
+    def on_memory_write(self, action: str, target: str, content: str, **kwargs) -> None:
         """Mirror built-in memory writes as facts."""
         if action == "add" and self._store and content:
             try:

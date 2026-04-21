@@ -5,6 +5,7 @@ import pytest
 from pathlib import Path
 
 from tools.memory_tool import (
+    DEFAULT_MEMORY_CLASS,
     MemoryStore,
     memory_tool,
     _scan_memory_content,
@@ -25,6 +26,10 @@ class TestMemorySchema:
         assert "like a diary" not in description
         assert "temporary task state" in description
         assert ">80%" not in description
+
+    def test_schema_exposes_structured_memory_class(self):
+        props = MEMORY_SCHEMA["parameters"]["properties"]
+        assert "memory_class" in props
 
 
 # =========================================================================
@@ -117,6 +122,8 @@ class TestMemoryStoreAdd:
         store.add("memory", "fact A")
         result = store.add("memory", "fact A")
         assert result["success"] is True  # No error, just a note
+        assert result["changed"] is False
+        assert result["entry"]["content"] == "fact A"
         assert len(store.memory_entries) == 1  # Not duplicated
 
     def test_add_exceeding_limit_rejected(self, store):
@@ -131,14 +138,35 @@ class TestMemoryStoreAdd:
         assert result["success"] is False
         assert "Blocked" in result["error"]
 
+    def test_add_structured_class(self, store):
+        result = store.add("user", "Prefers terse answers", entry_class="preference")
+        assert result["success"] is True
+        assert result["changed"] is True
+        assert result["entry"]["memory_class"] == "preference"
+        assert result["structured_entries"][0]["memory_class"] == "preference"
+        assert result["structured_entries"][0]["content"] == "Prefers terse answers"
+
+    def test_add_invalid_class_rejected(self, store):
+        result = store.add("memory", "Some fact", entry_class="preference")
+        assert result["success"] is False
+        assert "Invalid memory_class" in result["error"]
+
 
 class TestMemoryStoreReplace:
     def test_replace_entry(self, store):
         store.add("memory", "Python 3.11 project")
         result = store.replace("memory", "3.11", "Python 3.12 project")
         assert result["success"] is True
+        assert result["changed"] is True
+        assert result["entry"]["content"] == "Python 3.12 project"
         assert "Python 3.12 project" in result["entries"]
         assert "Python 3.11 project" not in result["entries"]
+
+    def test_replace_preserves_existing_class_when_memory_class_omitted(self, store):
+        store.add("memory", "Use uv for Python envs", entry_class="tooling")
+        result = store.replace("memory", "uv", "Use rye for Python envs")
+        assert result["success"] is True
+        assert result["entry"]["memory_class"] == "tooling"
 
     def test_replace_no_match(self, store):
         store.add("memory", "fact A")
@@ -151,6 +179,20 @@ class TestMemoryStoreReplace:
         result = store.replace("memory", "nginx", "apache")
         assert result["success"] is False
         assert "Multiple" in result["error"]
+
+    def test_replace_identical_content_with_different_classes_is_ambiguous(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("tools.memory_tool.MEMORY_DIR", tmp_path)
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+        (tmp_path / "MEMORY.md").write_text(
+            "[memory_class=tooling]\nUse uv for Python envs\n§\n"
+            "[memory_class=workflow]\nUse uv for Python envs"
+        )
+        store = MemoryStore()
+        store.load_from_disk()
+
+        result = store.replace("memory", "Use uv", "Use rye for Python envs")
+        assert result["success"] is False
+        assert "different classes" in result["error"]
 
     def test_replace_empty_old_text_rejected(self, store):
         result = store.replace("memory", "", "new")
@@ -172,11 +214,27 @@ class TestMemoryStoreRemove:
         store.add("memory", "temporary note")
         result = store.remove("memory", "temporary")
         assert result["success"] is True
+        assert result["changed"] is True
+        assert result["removed_entry"]["content"] == "temporary note"
         assert len(store.memory_entries) == 0
 
     def test_remove_no_match(self, store):
         result = store.remove("memory", "nonexistent")
         assert result["success"] is False
+
+    def test_remove_identical_content_with_different_classes_is_ambiguous(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("tools.memory_tool.MEMORY_DIR", tmp_path)
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+        (tmp_path / "MEMORY.md").write_text(
+            "[memory_class=tooling]\nUse uv for Python envs\n§\n"
+            "[memory_class=workflow]\nUse uv for Python envs"
+        )
+        store = MemoryStore()
+        store.load_from_disk()
+
+        result = store.remove("memory", "Use uv")
+        assert result["success"] is False
+        assert "different classes" in result["error"]
 
     def test_remove_empty_old_text(self, store):
         result = store.remove("memory", "  ")
@@ -206,6 +264,29 @@ class TestMemoryStorePersistence:
         store = MemoryStore()
         store.load_from_disk()
         assert len(store.memory_entries) == 2
+
+    def test_structured_entries_roundtrip(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("tools.memory_tool.MEMORY_DIR", tmp_path)
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+
+        store1 = MemoryStore()
+        store1.load_from_disk()
+        store1.add("memory", "Uses uv for Python envs", entry_class="tooling")
+
+        store2 = MemoryStore()
+        store2.load_from_disk()
+        assert store2.memory_entries == ["Uses uv for Python envs"]
+        assert store2.memory_records[0].memory_class == "tooling"
+
+    def test_legacy_entries_default_to_other_class(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("tools.memory_tool.MEMORY_DIR", tmp_path)
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+        (tmp_path / "MEMORY.md").write_text("legacy fact")
+
+        store = MemoryStore()
+        store.load_from_disk()
+        assert store.memory_records[0].content == "legacy fact"
+        assert store.memory_records[0].memory_class == DEFAULT_MEMORY_CLASS
 
 
 class TestMemoryStoreSnapshot:
@@ -247,6 +328,19 @@ class TestMemoryToolDispatcher:
     def test_add_via_tool(self, store):
         result = json.loads(memory_tool(action="add", target="memory", content="via tool", store=store))
         assert result["success"] is True
+
+    def test_add_via_tool_with_memory_class(self, store):
+        result = json.loads(
+            memory_tool(
+                action="add",
+                target="memory",
+                content="Project uses pytest",
+                memory_class="project",
+                store=store,
+            )
+        )
+        assert result["success"] is True
+        assert result["structured_entries"][0]["memory_class"] == "project"
 
     def test_replace_requires_old_text(self, store):
         result = json.loads(memory_tool(action="replace", content="new", store=store))

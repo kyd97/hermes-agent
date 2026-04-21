@@ -597,17 +597,13 @@ def _parse_wake_gate(script_output: str) -> bool:
     return gate.get("wakeAgent", True) is not False
 
 
-def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
-    """Build the effective prompt for a cron job, optionally loading one or more skills first.
-
-    Args:
-        job: The cron job dict.
-        prerun_script: Optional ``(success, stdout)`` from a script that has
-            already been executed by the caller (e.g. for a wake-gate check).
-            When provided, the script is not re-executed and the cached
-            result is used for prompt injection. When omitted, the script
-            (if any) runs inline as before.
-    """
+def _compose_job_instruction(
+    job: dict,
+    *,
+    include_cron_hint: bool = True,
+    prerun_script: Optional[tuple] = None,
+) -> str:
+    """Build the effective instruction for a cron job, with optional cron wrapper text."""
     prompt = job.get("prompt", "")
     skills = job.get("skills")
 
@@ -640,20 +636,19 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
                 f"{prompt}"
             )
 
-    # Always prepend cron execution guidance so the agent knows how
-    # delivery works and can suppress delivery when appropriate.
-    cron_hint = (
-        "[SYSTEM: You are running as a scheduled cron job. "
-        "DELIVERY: Your final response will be automatically delivered "
-        "to the user — do NOT use send_message or try to deliver "
-        "the output yourself. Just produce your report/output as your "
-        "final response and the system handles the rest. "
-        "SILENT: If there is genuinely nothing new to report, respond "
-        "with exactly \"[SILENT]\" (nothing else) to suppress delivery. "
-        "Never combine [SILENT] with content — either report your "
-        "findings normally, or say [SILENT] and nothing more.]\n\n"
-    )
-    prompt = cron_hint + prompt
+    if include_cron_hint:
+        cron_hint = (
+            "[SYSTEM: You are running as a scheduled cron job. "
+            "DELIVERY: Your final response will be automatically delivered "
+            "to the user — do NOT use send_message or try to deliver "
+            "the output yourself. Just produce your report/output as your "
+            "final response and the system handles the rest. "
+            "SILENT: If there is genuinely nothing new to report, respond "
+            "with exactly \"[SILENT]\" (nothing else) to suppress delivery. "
+            "Never combine [SILENT] with content — either report your "
+            "findings normally, or say [SILENT] and nothing more.]\n\n"
+        )
+        prompt = cron_hint + prompt
     if skills is None:
         legacy = job.get("skill")
         skills = [legacy] if legacy else []
@@ -699,6 +694,101 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     return "\n".join(parts)
 
 
+def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
+    """Build the effective prompt for a cron job, optionally loading one or more skills first."""
+    return _compose_job_instruction(job, include_cron_hint=True, prerun_script=prerun_script)
+
+
+def _merge_delegate_context(*parts: str) -> str:
+    return "\n\n".join(str(part).strip() for part in parts if str(part or "").strip())
+
+
+def _build_delegate_payload(job: dict, instruction: str) -> dict:
+    """Build delegate_task kwargs for a delegated cron run."""
+    delegate_cfg = job.get("delegate") or {}
+    shared_context = _merge_delegate_context(
+        "CRON JOB INSTRUCTION:\n" + instruction if instruction else "",
+        delegate_cfg.get("context") or "",
+    )
+
+    if delegate_cfg.get("tasks"):
+        tasks = []
+        for task in delegate_cfg["tasks"]:
+            tasks.append(
+                {
+                    "goal": task["goal"],
+                    "context": _merge_delegate_context(shared_context, task.get("context") or ""),
+                    "toolsets": task.get("toolsets") or delegate_cfg.get("toolsets"),
+                    "acp_command": task.get("acp_command") or delegate_cfg.get("acp_command"),
+                    "acp_args": task.get("acp_args") or delegate_cfg.get("acp_args"),
+                }
+            )
+        payload = {"tasks": tasks}
+    else:
+        payload = {
+            "goal": str(delegate_cfg.get("goal") or job.get("prompt") or "Execute the scheduled cron job").strip(),
+            "context": shared_context,
+            "toolsets": delegate_cfg.get("toolsets"),
+        }
+        if delegate_cfg.get("acp_command"):
+            payload["acp_command"] = delegate_cfg["acp_command"]
+        if delegate_cfg.get("acp_args"):
+            payload["acp_args"] = list(delegate_cfg["acp_args"])
+
+    if delegate_cfg.get("max_iterations"):
+        payload["max_iterations"] = delegate_cfg["max_iterations"]
+    return payload
+
+
+def _render_delegate_results(payload: dict, delegate_request: dict) -> tuple[bool, str]:
+    """Render delegate_task results into a user-facing summary."""
+    results = list(payload.get("results") or [])
+    if not results:
+        return False, "Delegated cron run returned no child results."
+
+    tasks = delegate_request.get("tasks") or []
+    success_count = 0
+    lines: list[str] = []
+    for index, entry in enumerate(results, start=1):
+        status = str(entry.get("status") or "unknown")
+        if status == "completed":
+            success_count += 1
+        summary = str(entry.get("summary") or "").strip()
+        error = str(entry.get("error") or "").strip()
+        task_goal = ""
+        if tasks and index - 1 < len(tasks):
+            task_goal = str(tasks[index - 1].get("goal") or "").strip()
+        elif delegate_request.get("goal"):
+            task_goal = str(delegate_request.get("goal") or "").strip()
+        label = task_goal or f"Task {index}"
+        if summary:
+            lines.append(f"- [{status}] {label}\n{summary}")
+        elif error:
+            lines.append(f"- [{status}] {label}\nError: {error}")
+        else:
+            lines.append(f"- [{status}] {label}")
+
+    total = len(results)
+    header = f"Delegated cron run finished: {success_count}/{total} task(s) completed."
+    rendered = header if total == 1 and len(lines) == 1 else header + "\n\n" + "\n\n".join(lines)
+    return success_count == total, rendered
+
+
+def _run_job_via_delegate(job: dict, controller_agent, instruction: str) -> tuple[bool, str, Optional[str]]:
+    """Execute a cron job via delegate_task instead of a normal top-level agent turn."""
+    from tools.delegate_tool import delegate_task
+
+    delegate_request = _build_delegate_payload(job, instruction)
+    raw = delegate_task(parent_agent=controller_agent, **delegate_request)
+    parsed = json.loads(raw)
+    if parsed.get("error"):
+        return False, "", str(parsed.get("error"))
+    success, rendered = _render_delegate_results(parsed, delegate_request)
+    if not rendered:
+        return False, "", "Delegated cron run returned no summary."
+    return True, rendered, None
+
+
 def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
@@ -742,7 +832,12 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             )
             return True, silent_doc, SILENT_MARKER, None
 
-    prompt = _build_job_prompt(job, prerun_script=prerun_script)
+    execution_mode = str(job.get("execution_mode") or "agent").strip().lower() or "agent"
+    prompt = (
+        _compose_job_instruction(job, include_cron_hint=False, prerun_script=prerun_script)
+        if execution_mode == "delegate"
+        else _build_job_prompt(job, prerun_script=prerun_script)
+    )
     origin = _resolve_origin(job)
     _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
 
@@ -911,7 +1006,10 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # env passthrough registrations) when the cron run hops into the worker
         # thread used for inactivity timeout monitoring.
         _cron_context = contextvars.copy_context()
-        _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
+        if execution_mode == "delegate":
+            _cron_future = _cron_pool.submit(_cron_context.run, _run_job_via_delegate, job, agent, prompt)
+        else:
+            _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
         _inactivity_timeout = False
         try:
             if _cron_inactivity_limit is None:
@@ -972,7 +1070,13 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 f"— last activity: {_last_desc}"
             )
 
-        final_response = result.get("final_response", "") or ""
+        if execution_mode == "delegate":
+            success, final_response, delegate_error = result
+            error = delegate_error
+        else:
+            final_response = result.get("final_response", "") or ""
+            error = None
+            success = True
         # Strip leaked placeholder text that upstream may inject on empty completions.
         if final_response.strip() == "(No response generated)":
             final_response = ""
@@ -985,6 +1089,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
 **Job ID:** {job_id}
 **Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}
 **Schedule:** {job.get('schedule_display', 'N/A')}
+**Execution Mode:** {execution_mode}
 
 ## Prompt
 
@@ -995,8 +1100,13 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
 {logged_response}
 """
         
-        logger.info("Job '%s' completed successfully", job_name)
-        return True, output, final_response, None
+        if success:
+            logger.info("Job '%s' completed successfully", job_name)
+            return True, output, final_response, None
+
+        error_msg = error or "Delegated cron run failed."
+        logger.error("Job '%s' completed with delegated execution errors: %s", job_name, error_msg)
+        return False, output, final_response, error_msg
         
     except Exception as e:
         error_msg = f"{type(e).__name__}: {str(e)}"

@@ -43,6 +43,15 @@ skills/
 
 ## SKILL.md Format
 
+Hermes now enforces a few authoring checks when the agent creates or rewrites skills via `skill_manage`:
+
+- frontmatter `name` must be a valid canonical skill name (`lowercase`, `-`, `_`, `.`)
+- frontmatter `name` must match the target skill being created/edited
+- `metadata.hermes.related_skills` entries must also use canonical skill names
+- a non-empty markdown body is required after the frontmatter
+
+In addition to hard validation, Hermes returns **lint warnings** for weak-but-allowed authoring patterns such as missing `## When to Use`, `## Verification`, `## Pitfalls`, or `## Procedure` / `## Quick Reference` sections.
+
 ```markdown
 ---
 name: my-skill

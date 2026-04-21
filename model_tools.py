@@ -131,6 +131,15 @@ def _run_async(coro):
 
 discover_builtin_tools()
 
+# Local evolution extension: ensure custom status tooling is discoverable even
+# when it is not part of the upstream built-in discovery table yet.
+try:
+    import importlib
+
+    importlib.import_module("tools.work_status_tool")
+except Exception as e:
+    logger.warning("Could not import tool module tools.work_status_tool: %s", e)
+
 # MCP tool discovery (external MCP servers from config)
 try:
     from tools.mcp_tool import discover_mcp_tools

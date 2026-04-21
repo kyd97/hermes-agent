@@ -31,7 +31,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 8
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -88,6 +88,39 @@ CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
+
+CREATE TABLE IF NOT EXISTS episodic_summaries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES sessions(id),
+    kind TEXT NOT NULL DEFAULT 'compression',
+    summary TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES sessions(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_episodic_summaries_session ON episodic_summaries(session_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_episodic_summaries_created ON episodic_summaries(created_at DESC);
+
+CREATE TABLE IF NOT EXISTS skill_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT,
+    session_key TEXT,
+    timestamp REAL NOT NULL,
+    source TEXT,
+    skill_name TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    trigger TEXT,
+    parent_skill_name TEXT,
+    success INTEGER,
+    metadata_json TEXT,
+    FOREIGN KEY (session_id) REFERENCES sessions(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_skill_events_skill_time ON skill_events(skill_name, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_skill_events_session ON skill_events(session_id, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_skill_events_session_key ON skill_events(session_key, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_skill_events_type_time ON skill_events(event_type, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_skill_events_source_time ON skill_events(source, timestamp DESC);
 """
 
 FTS_SQL = """
@@ -329,6 +362,64 @@ class SessionDB:
                     except sqlite3.OperationalError:
                         pass  # Column already exists
                 cursor.execute("UPDATE schema_version SET version = 6")
+            if current_version < 7:
+                cursor.execute(
+                    """CREATE TABLE IF NOT EXISTS episodic_summaries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL REFERENCES sessions(id),
+                    kind TEXT NOT NULL DEFAULT 'compression',
+                    summary TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    FOREIGN KEY (session_id) REFERENCES sessions(id)
+                )"""
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_episodic_summaries_session "
+                    "ON episodic_summaries(session_id, created_at DESC)"
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_episodic_summaries_created "
+                    "ON episodic_summaries(created_at DESC)"
+                )
+                cursor.execute("UPDATE schema_version SET version = 7")
+            if current_version < 8:
+                cursor.execute(
+                    """CREATE TABLE IF NOT EXISTS skill_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT,
+                    session_key TEXT,
+                    timestamp REAL NOT NULL,
+                    source TEXT,
+                    skill_name TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    trigger TEXT,
+                    parent_skill_name TEXT,
+                    success INTEGER,
+                    metadata_json TEXT,
+                    FOREIGN KEY (session_id) REFERENCES sessions(id)
+                )"""
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_skill_events_skill_time "
+                    "ON skill_events(skill_name, timestamp DESC)"
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_skill_events_session "
+                    "ON skill_events(session_id, timestamp DESC)"
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_skill_events_session_key "
+                    "ON skill_events(session_key, timestamp DESC)"
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_skill_events_type_time "
+                    "ON skill_events(event_type, timestamp DESC)"
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_skill_events_source_time "
+                    "ON skill_events(source, timestamp DESC)"
+                )
+                cursor.execute("UPDATE schema_version SET version = 8")
 
         # Unique title index — always ensure it exists (safe to run after migrations
         # since the title column is guaranteed to exist at this point)
@@ -564,6 +655,43 @@ class SessionDB:
         if len(matches) == 1:
             return matches[0]
         return None
+
+    def get_lineage_session_ids(self, session_id: str, include_self: bool = True) -> List[str]:
+        """Return all ancestor/descendant session ids in the same lineage."""
+        if not session_id:
+            return []
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                WITH RECURSIVE
+                  ancestors(id) AS (
+                    SELECT id FROM sessions WHERE id = ?
+                    UNION
+                    SELECT s.parent_session_id
+                    FROM sessions s
+                    JOIN ancestors a ON s.id = a.id
+                    WHERE s.parent_session_id IS NOT NULL
+                  ),
+                  descendants(id) AS (
+                    SELECT id FROM sessions WHERE id = ?
+                    UNION
+                    SELECT s.id
+                    FROM sessions s
+                    JOIN descendants d ON s.parent_session_id = d.id
+                  )
+                SELECT DISTINCT id FROM (
+                  SELECT id FROM ancestors
+                  UNION
+                  SELECT id FROM descendants
+                )
+                WHERE id IS NOT NULL
+                """,
+                (session_id, session_id),
+            )
+            ids = [row["id"] for row in cursor.fetchall()]
+        if not include_self:
+            ids = [sid for sid in ids if sid != session_id]
+        return ids
 
     # Maximum length for session titles
     MAX_TITLE_LENGTH = 100
@@ -1053,6 +1181,84 @@ class SessionDB:
             messages.append(msg)
         return messages
 
+    def append_episodic_summary(
+        self,
+        session_id: str,
+        summary: str,
+        *,
+        kind: str = "compression",
+    ) -> int:
+        """Persist a compact episodic summary for later recall."""
+        cleaned_summary = (summary or "").strip()
+        if not cleaned_summary:
+            return 0
+
+        def _do(conn):
+            cursor = conn.execute(
+                """INSERT INTO episodic_summaries (session_id, kind, summary, created_at)
+                   VALUES (?, ?, ?, ?)""",
+                (session_id, kind, cleaned_summary, time.time()),
+            )
+            return cursor.lastrowid
+
+        return self._execute_write(_do)
+
+    def search_episodic_summaries(
+        self,
+        query: str,
+        *,
+        exclude_session_ids: Optional[List[str]] = None,
+        limit: int = 3,
+        source: Optional[str] = None,
+        user_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Search stored episodic summaries using lightweight term scoring."""
+        if not query or not query.strip():
+            return []
+
+        terms = [
+            t.lower()
+            for t in re.findall(r"\w+", query)
+            if t.strip() and len(t) >= 3 and t.lower() not in {
+                "the", "and", "for", "with", "that", "this", "have", "from",
+                "your", "please", "help", "issue", "fix", "revisit", "what",
+            }
+        ]
+        if not terms:
+            return []
+
+        score_expr = " + ".join("CASE WHEN LOWER(es.summary) LIKE ? THEN 1 ELSE 0 END" for _ in terms)
+        score_params: List[Any] = [f"%{term}%" for term in terms]
+        where_clauses = [f"({score_expr}) > 0"]
+        where_params: List[Any] = list(score_params)
+        exclude_params: List[Any] = []
+        if exclude_session_ids:
+            placeholders = ",".join("?" for _ in exclude_session_ids)
+            where_clauses.append(f"es.session_id NOT IN ({placeholders})")
+            exclude_params.extend(exclude_session_ids)
+        if source:
+            where_clauses.append("s.source = ?")
+            exclude_params.append(source)
+        if user_id is not None:
+            where_clauses.append("s.user_id = ?")
+            exclude_params.append(user_id)
+        params: List[Any] = list(score_params) + where_params + exclude_params + [limit]
+
+        sql = f"""
+            SELECT es.id, es.session_id, es.kind, es.summary, es.created_at,
+                   s.source, s.model, s.title, s.started_at,
+                   ({score_expr}) AS match_score
+            FROM episodic_summaries es
+            JOIN sessions s ON s.id = es.session_id
+            WHERE {' AND '.join(where_clauses)}
+            ORDER BY match_score DESC, es.created_at DESC
+            LIMIT ?
+        """
+        with self._lock:
+            cursor = self._conn.execute(sql, params)
+            rows = cursor.fetchall()
+        return [dict(row) for row in rows]
+
     # =========================================================================
     # Search
     # =========================================================================
@@ -1340,6 +1546,361 @@ class SessionDB:
             else:
                 cursor = self._conn.execute("SELECT COUNT(*) FROM messages")
             return cursor.fetchone()[0]
+
+    # =========================================================================
+    # Skill analytics
+    # =========================================================================
+
+    def log_skill_event(
+        self,
+        *,
+        skill_name: str,
+        event_type: str,
+        session_id: str = None,
+        session_key: str = None,
+        source: str = None,
+        trigger: str = None,
+        parent_skill_name: str = None,
+        success: bool = None,
+        metadata: Dict[str, Any] = None,
+        timestamp: float = None,
+    ) -> None:
+        """Persist a single skill analytics event."""
+        normalized_skill = str(skill_name or "").strip()
+        normalized_type = str(event_type or "").strip()
+        if not normalized_skill or not normalized_type:
+            return
+
+        payload = None
+        if metadata:
+            try:
+                payload = json.dumps(metadata, ensure_ascii=False, separators=(",", ":"))
+            except Exception:
+                payload = json.dumps({"repr": repr(metadata)}, ensure_ascii=False)
+
+        success_int = None if success is None else (1 if success else 0)
+
+        def _do(conn):
+            resolved_session_id = session_id
+            if resolved_session_id:
+                existing = conn.execute(
+                    "SELECT 1 FROM sessions WHERE id = ? LIMIT 1",
+                    (resolved_session_id,),
+                ).fetchone()
+                if not existing:
+                    resolved_session_id = None
+            conn.execute(
+                """INSERT INTO skill_events (
+                       session_id, session_key, timestamp, source, skill_name,
+                       event_type, trigger, parent_skill_name, success, metadata_json
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    resolved_session_id,
+                    session_key,
+                    float(timestamp if timestamp is not None else time.time()),
+                    source,
+                    normalized_skill,
+                    normalized_type,
+                    trigger,
+                    parent_skill_name,
+                    success_int,
+                    payload,
+                ),
+            )
+
+        self._execute_write(_do)
+
+    def get_skill_analytics(self, days: int = 30) -> Dict[str, Any]:
+        """Aggregate skill activity for dashboard analytics views."""
+        cutoff = time.time() - (days * 86400)
+        with self._lock:
+            daily = [
+                dict(row)
+                for row in self._conn.execute(
+                    """
+                    SELECT
+                        date(timestamp, 'unixepoch') AS day,
+                        SUM(CASE WHEN event_type = 'viewed' THEN 1 ELSE 0 END) AS views,
+                        SUM(CASE WHEN event_type = 'invoked' THEN 1 ELSE 0 END) AS invocations,
+                        SUM(CASE WHEN event_type = 'preloaded' THEN 1 ELSE 0 END) AS preloads,
+                        SUM(CASE WHEN event_type = 'chained' THEN 1 ELSE 0 END) AS chained,
+                        COUNT(DISTINCT skill_name) AS unique_skills
+                    FROM skill_events
+                    WHERE timestamp > ?
+                    GROUP BY day
+                    ORDER BY day
+                    """,
+                    (cutoff,),
+                ).fetchall()
+            ]
+            top_skills = [
+                dict(row)
+                for row in self._conn.execute(
+                    """
+                    SELECT
+                        skill_name,
+                        SUM(CASE WHEN event_type = 'viewed' THEN 1 ELSE 0 END) AS views,
+                        SUM(CASE WHEN event_type = 'invoked' THEN 1 ELSE 0 END) AS invocations,
+                        SUM(CASE WHEN event_type = 'preloaded' THEN 1 ELSE 0 END) AS preloads,
+                        SUM(CASE WHEN event_type = 'chained' THEN 1 ELSE 0 END) AS chained,
+                        SUM(CASE WHEN event_type = 'installed' THEN 1 ELSE 0 END) AS installs,
+                        SUM(CASE WHEN event_type = 'updated' THEN 1 ELSE 0 END) AS updates,
+                        SUM(CASE WHEN event_type = 'deleted' THEN 1 ELSE 0 END) AS deletes,
+                        COUNT(DISTINCT COALESCE(NULLIF(session_id, ''), NULLIF(session_key, ''))) AS unique_sessions,
+                        MAX(timestamp) AS last_used_at,
+                        MIN(timestamp) AS first_seen_at
+                    FROM skill_events
+                    WHERE timestamp > ?
+                    GROUP BY skill_name
+                    ORDER BY (views + invocations + preloads + chained + installs + updates + deletes) DESC, last_used_at DESC
+                    LIMIT 20
+                    """,
+                    (cutoff,),
+                ).fetchall()
+            ]
+            totals_row = self._conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS total_events,
+                    COALESCE(SUM(CASE WHEN event_type = 'viewed' THEN 1 ELSE 0 END), 0) AS total_views,
+                    COALESCE(SUM(CASE WHEN event_type = 'invoked' THEN 1 ELSE 0 END), 0) AS total_invocations,
+                    COALESCE(SUM(CASE WHEN event_type = 'preloaded' THEN 1 ELSE 0 END), 0) AS total_preloads,
+                    COALESCE(SUM(CASE WHEN event_type = 'chained' THEN 1 ELSE 0 END), 0) AS total_chained,
+                    COALESCE(SUM(CASE WHEN event_type = 'installed' THEN 1 ELSE 0 END), 0) AS total_installs,
+                    COALESCE(SUM(CASE WHEN event_type = 'updated' THEN 1 ELSE 0 END), 0) AS total_updates,
+                    COALESCE(SUM(CASE WHEN event_type = 'deleted' THEN 1 ELSE 0 END), 0) AS total_deletes,
+                    COUNT(DISTINCT skill_name) AS unique_skills_used
+                FROM skill_events
+                WHERE timestamp > ?
+                """,
+                (cutoff,),
+            ).fetchone()
+
+        return {
+            "period_days": days,
+            "daily": daily,
+            "top_skills": top_skills,
+            "totals": dict(totals_row) if totals_row else {
+                "total_events": 0,
+                "total_views": 0,
+                "total_invocations": 0,
+                "total_preloads": 0,
+                "total_chained": 0,
+                "total_installs": 0,
+                "total_updates": 0,
+                "total_deletes": 0,
+                "unique_skills_used": 0,
+            },
+        }
+
+    def get_skill_stats(self, days: int = 30) -> List[Dict[str, Any]]:
+        """Return per-skill usage stats for the selected time window."""
+        cutoff = time.time() - (days * 86400)
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT
+                    skill_name,
+                    SUM(CASE WHEN event_type = 'viewed' THEN 1 ELSE 0 END) AS views,
+                    SUM(CASE WHEN event_type = 'invoked' THEN 1 ELSE 0 END) AS invocations,
+                    SUM(CASE WHEN event_type = 'preloaded' THEN 1 ELSE 0 END) AS preloads,
+                    SUM(CASE WHEN event_type = 'chained' THEN 1 ELSE 0 END) AS chained,
+                    SUM(CASE WHEN event_type = 'installed' THEN 1 ELSE 0 END) AS installs,
+                    SUM(CASE WHEN event_type = 'updated' THEN 1 ELSE 0 END) AS updates,
+                    SUM(CASE WHEN event_type = 'deleted' THEN 1 ELSE 0 END) AS deletes,
+                    COUNT(DISTINCT COALESCE(NULLIF(session_id, ''), NULLIF(session_key, ''))) AS unique_sessions,
+                    MAX(timestamp) AS last_used_at,
+                    MIN(timestamp) AS first_seen_at
+                FROM skill_events
+                WHERE timestamp > ?
+                GROUP BY skill_name
+                ORDER BY (views + invocations + preloads + chained + installs + updates + deletes) DESC, last_used_at DESC
+                """,
+                (cutoff,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def get_skill_detail(self, skill_name: str, days: int = 30) -> Dict[str, Any]:
+        """Return detailed analytics for one skill."""
+        cutoff = time.time() - (days * 86400)
+        with self._lock:
+            summary_row = self._conn.execute(
+                """
+                SELECT
+                    skill_name,
+                    SUM(CASE WHEN event_type = 'viewed' THEN 1 ELSE 0 END) AS views,
+                    SUM(CASE WHEN event_type = 'invoked' THEN 1 ELSE 0 END) AS invocations,
+                    SUM(CASE WHEN event_type = 'preloaded' THEN 1 ELSE 0 END) AS preloads,
+                    SUM(CASE WHEN event_type = 'chained' THEN 1 ELSE 0 END) AS chained,
+                    SUM(CASE WHEN event_type = 'installed' THEN 1 ELSE 0 END) AS installs,
+                    SUM(CASE WHEN event_type = 'updated' THEN 1 ELSE 0 END) AS updates,
+                    SUM(CASE WHEN event_type = 'deleted' THEN 1 ELSE 0 END) AS deletes,
+                    COUNT(DISTINCT COALESCE(NULLIF(session_id, ''), NULLIF(session_key, ''))) AS unique_sessions,
+                    MAX(timestamp) AS last_used_at,
+                    MIN(timestamp) AS first_seen_at
+                FROM skill_events
+                WHERE timestamp > ? AND skill_name = ?
+                GROUP BY skill_name
+                """,
+                (cutoff, skill_name),
+            ).fetchone()
+            if summary_row is None:
+                return {"skill_name": skill_name, "summary": None, "daily": [], "by_trigger": [], "recent_events": []}
+
+            daily = [
+                dict(row)
+                for row in self._conn.execute(
+                    """
+                    SELECT
+                        date(timestamp, 'unixepoch') AS day,
+                        SUM(CASE WHEN event_type = 'viewed' THEN 1 ELSE 0 END) AS views,
+                        SUM(CASE WHEN event_type = 'invoked' THEN 1 ELSE 0 END) AS invocations,
+                        SUM(CASE WHEN event_type = 'preloaded' THEN 1 ELSE 0 END) AS preloads,
+                        SUM(CASE WHEN event_type = 'chained' THEN 1 ELSE 0 END) AS chained,
+                        SUM(CASE WHEN event_type = 'installed' THEN 1 ELSE 0 END) AS installs,
+                        SUM(CASE WHEN event_type = 'updated' THEN 1 ELSE 0 END) AS updates,
+                        SUM(CASE WHEN event_type = 'deleted' THEN 1 ELSE 0 END) AS deletes
+                    FROM skill_events
+                    WHERE timestamp > ? AND skill_name = ?
+                    GROUP BY day
+                    ORDER BY day
+                    """,
+                    (cutoff, skill_name),
+                ).fetchall()
+            ]
+            by_trigger = [
+                dict(row)
+                for row in self._conn.execute(
+                    """
+                    SELECT COALESCE(trigger, 'unknown') AS trigger, COUNT(*) AS count
+                    FROM skill_events
+                    WHERE timestamp > ? AND skill_name = ?
+                    GROUP BY COALESCE(trigger, 'unknown')
+                    ORDER BY count DESC, trigger ASC
+                    """,
+                    (cutoff, skill_name),
+                ).fetchall()
+            ]
+            recent_rows = self._conn.execute(
+                """
+                SELECT timestamp, source, event_type, trigger, parent_skill_name, success, metadata_json
+                FROM skill_events
+                WHERE timestamp > ? AND skill_name = ?
+                ORDER BY timestamp DESC
+                LIMIT 20
+                """,
+                (cutoff, skill_name),
+            ).fetchall()
+
+        recent_events = []
+        for row in recent_rows:
+            item = dict(row)
+            raw_metadata = item.get("metadata_json")
+            if raw_metadata:
+                try:
+                    item["metadata"] = json.loads(raw_metadata)
+                except Exception:
+                    item["metadata"] = None
+            item.pop("metadata_json", None)
+            recent_events.append(item)
+
+        return {
+            "skill_name": skill_name,
+            "summary": dict(summary_row),
+            "daily": daily,
+            "by_trigger": by_trigger,
+            "recent_events": recent_events,
+        }
+
+    def backfill_skill_events_from_messages(self) -> Dict[str, Any]:
+        """Best-effort historical backfill from stored message content markers."""
+        invocation_re = re.compile(r'The user has invoked the "([^"]+)" skill')
+        preload_re = re.compile(r'launched this CLI session with the "([^"]+)" skill preloaded')
+        chained_re = re.compile(r'The "([^"]+)" skill declares "([^"]+)" as a related skill')
+
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT m.session_id, s.source, m.timestamp, m.content
+                FROM messages m
+                JOIN sessions s ON s.id = m.session_id
+                WHERE m.content IS NOT NULL
+                ORDER BY m.timestamp ASC, m.id ASC
+                """
+            ).fetchall()
+
+        inferred_events: List[Dict[str, Any]] = []
+        for row in rows:
+            content = row["content"] or ""
+            for match in invocation_re.finditer(content):
+                inferred_events.append(
+                    {
+                        "skill_name": match.group(1),
+                        "event_type": "invoked",
+                        "session_id": row["session_id"],
+                        "source": row["source"],
+                        "trigger": "historical_message_mining",
+                        "timestamp": row["timestamp"],
+                        "metadata": {"inferred": True, "source": "historical_message_mining"},
+                    }
+                )
+            for match in preload_re.finditer(content):
+                inferred_events.append(
+                    {
+                        "skill_name": match.group(1),
+                        "event_type": "preloaded",
+                        "session_id": row["session_id"],
+                        "source": row["source"],
+                        "trigger": "historical_message_mining",
+                        "timestamp": row["timestamp"],
+                        "metadata": {"inferred": True, "source": "historical_message_mining"},
+                    }
+                )
+            for match in chained_re.finditer(content):
+                inferred_events.append(
+                    {
+                        "skill_name": match.group(2),
+                        "event_type": "chained",
+                        "session_id": row["session_id"],
+                        "source": row["source"],
+                        "trigger": "historical_message_mining",
+                        "parent_skill_name": match.group(1),
+                        "timestamp": row["timestamp"],
+                        "metadata": {"inferred": True, "source": "historical_message_mining"},
+                    }
+                )
+
+        def _do(conn):
+            conn.execute(
+                "DELETE FROM skill_events WHERE trigger = ?",
+                ("historical_message_mining",),
+            )
+            for event in inferred_events:
+                conn.execute(
+                    """INSERT INTO skill_events (
+                        session_id, session_key, timestamp, source, skill_name,
+                        event_type, trigger, parent_skill_name, success, metadata_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        event.get("session_id"),
+                        None,
+                        float(event.get("timestamp") or time.time()),
+                        event.get("source"),
+                        event.get("skill_name"),
+                        event.get("event_type"),
+                        event.get("trigger"),
+                        event.get("parent_skill_name"),
+                        None,
+                        json.dumps(event.get("metadata") or {}, ensure_ascii=False, separators=(",", ":")),
+                    ),
+                )
+
+        self._execute_write(_do)
+        return {
+            "success": True,
+            "events_backfilled": len(inferred_events),
+            "sessions_scanned": len({row["session_id"] for row in rows}),
+        }
 
     # =========================================================================
     # Export and cleanup

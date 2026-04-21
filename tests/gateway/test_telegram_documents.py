@@ -60,11 +60,11 @@ from gateway.platforms.telegram import TelegramAdapter  # noqa: E402
 # Helpers to build mock Telegram objects
 # ---------------------------------------------------------------------------
 
-def _make_file_obj(data: bytes = b"hello"):
+def _make_file_obj(data: bytes = b"hello", file_path: str = "documents/file.pdf"):
     """Create a mock Telegram File with download_as_bytearray."""
     f = AsyncMock()
     f.download_as_bytearray = AsyncMock(return_value=bytearray(data))
-    f.file_path = "documents/file.pdf"
+    f.file_path = file_path
     return f
 
 
@@ -83,8 +83,8 @@ def _make_document(
     return doc
 
 
-def _make_message(document=None, caption=None, media_group_id=None, photo=None):
-    """Build a mock Telegram Message with the given document/photo."""
+def _make_message(document=None, caption=None, media_group_id=None, photo=None, audio=None, voice=None):
+    """Build a mock Telegram Message with the given document/photo/audio."""
     msg = MagicMock()
     msg.message_id = 42
     msg.text = caption or ""
@@ -93,8 +93,8 @@ def _make_message(document=None, caption=None, media_group_id=None, photo=None):
     # Media flags — all None except explicit payload
     msg.photo = photo
     msg.video = None
-    msg.audio = None
-    msg.voice = None
+    msg.audio = audio
+    msg.voice = voice
     msg.sticker = None
     msg.document = document
     msg.media_group_id = media_group_id
@@ -183,6 +183,13 @@ def _make_photo(file_obj=None):
     return photo
 
 
+def _make_audio(file_name="clip.mp3", file_obj=None):
+    audio = MagicMock()
+    audio.file_name = file_name
+    audio.get_file = AsyncMock(return_value=file_obj or _make_file_obj(b"audio-bytes",))
+    return audio
+
+
 class TestDocumentDownloadBlock:
     @pytest.mark.asyncio
     async def test_supported_pdf_is_cached(self, adapter):
@@ -197,6 +204,33 @@ class TestDocumentDownloadBlock:
         assert len(event.media_urls) == 1
         assert os.path.exists(event.media_urls[0])
         assert event.media_types == ["application/pdf"]
+        assert event.attachments[0].filename == "report.pdf"
+        assert event.attachments[0].media_type == "application/pdf"
+
+    @pytest.mark.asyncio
+    async def test_photo_uses_canonical_image_mime(self, adapter):
+        jpeg_bytes = b"\xff\xd8\xff\xe0" + b"0" * 16
+        adapter._enqueue_photo_event = MagicMock()
+        msg = _make_message(photo=[_make_photo(_make_file_obj(jpeg_bytes, file_path="photos/pic.jpg"))])
+        update = _make_update(msg)
+
+        await adapter._handle_media_message(update, MagicMock())
+
+        event = adapter._enqueue_photo_event.call_args[0][1]
+        assert event.media_types == ["image/jpeg"]
+        assert event.attachments[0].media_type == "image/jpeg"
+
+    @pytest.mark.asyncio
+    async def test_audio_uses_canonical_mpeg_mime(self, adapter):
+        msg = _make_message(audio=_make_audio("clip.mp3", _make_file_obj(b"audio", file_path="audio/clip.mp3")))
+        update = _make_update(msg)
+
+        await adapter._handle_media_message(update, MagicMock())
+
+        event = adapter.handle_message.call_args[0][0]
+        assert event.media_types == ["audio/mpeg"]
+        assert event.attachments[0].media_type == "audio/mpeg"
+        assert event.attachments[0].filename == "clip.mp3"
 
     @pytest.mark.asyncio
     async def test_supported_txt_injects_content(self, adapter):

@@ -22,6 +22,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -2082,6 +2083,83 @@ class SkillToggle(BaseModel):
     enabled: bool
 
 
+class SkillBackfillRequest(BaseModel):
+    run: bool = True
+
+
+def _skill_usage_total(skill: Dict[str, Any]) -> int:
+    return int(
+        (skill.get("views", 0) or 0)
+        + (skill.get("invocations", 0) or 0)
+        + (skill.get("preloads", 0) or 0)
+        + (skill.get("chained", 0) or 0)
+        + (skill.get("installs", 0) or 0)
+        + (skill.get("updates", 0) or 0)
+        + (skill.get("deletes", 0) or 0)
+    )
+
+
+def _tokenize_skill_text(text: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", (text or "").lower())
+        if len(token) >= 4
+    }
+
+
+def _build_skill_cleanup_report(skills: List[Dict[str, Any]], days: int) -> Dict[str, Any]:
+    dead_skills = []
+    for skill in skills:
+        usage_total = _skill_usage_total(skill)
+        if usage_total == 0:
+            dead_skills.append(
+                {
+                    "name": skill["name"],
+                    "category": skill.get("category"),
+                    "enabled": skill.get("enabled", True),
+                    "last_used_at": skill.get("last_used_at"),
+                    "usage_total": usage_total,
+                    "reason": f"No recorded activity in the last {days} days",
+                }
+            )
+
+    duplicate_candidates = []
+    for index, left in enumerate(skills):
+        left_tokens = _tokenize_skill_text(f"{left.get('name', '')} {left.get('description', '')}")
+        if not left_tokens:
+            continue
+        for right in skills[index + 1:]:
+            right_tokens = _tokenize_skill_text(f"{right.get('name', '')} {right.get('description', '')}")
+            if not right_tokens:
+                continue
+            overlap = left_tokens & right_tokens
+            union = left_tokens | right_tokens
+            similarity = len(overlap) / max(len(union), 1)
+            same_prefix = left["name"].split("-")[0] == right["name"].split("-")[0]
+            if similarity >= 0.55 or (same_prefix and similarity >= 0.35):
+                duplicate_candidates.append(
+                    {
+                        "left": left["name"],
+                        "right": right["name"],
+                        "similarity": round(similarity, 2),
+                        "left_usage": _skill_usage_total(left),
+                        "right_usage": _skill_usage_total(right),
+                    }
+                )
+
+    duplicate_candidates.sort(key=lambda item: (-item["similarity"], item["left"], item["right"]))
+    dead_skills.sort(key=lambda item: (item["enabled"], item["name"]))
+    return {
+        "period_days": days,
+        "dead_skills": dead_skills,
+        "duplicate_candidates": duplicate_candidates[:20],
+        "summary": {
+            "dead_skill_count": len(dead_skills),
+            "duplicate_candidate_count": len(duplicate_candidates),
+        },
+    }
+
+
 @app.get("/api/skills")
 async def get_skills():
     from tools.skills_tool import _find_all_skills
@@ -2103,8 +2181,182 @@ async def toggle_skill(body: SkillToggle):
         disabled.discard(body.name)
     else:
         disabled.add(body.name)
-    save_disabled_skills(config, disabled)
+    save_disabled_skills(config, disabled, action_source="web_dashboard")
     return {"ok": True, "name": body.name, "enabled": body.enabled}
+
+
+@app.get("/api/skills/stats")
+async def get_skill_stats(days: int = 30):
+    from tools.skills_tool import _find_all_skills
+    from hermes_cli.skills_config import get_disabled_skills
+    from hermes_state import SessionDB
+
+    config = load_config()
+    disabled = get_disabled_skills(config)
+    inventory = _find_all_skills(skip_disabled=True)
+    db = SessionDB()
+    try:
+        stats_rows = db.get_skill_stats(days=days)
+    finally:
+        db.close()
+
+    stats_by_name = {row["skill_name"]: row for row in stats_rows}
+    enriched = []
+    for skill in inventory:
+        row = stats_by_name.get(skill["name"], {})
+        enriched.append(
+            {
+                **skill,
+                "enabled": skill["name"] not in disabled,
+                "views": row.get("views", 0) or 0,
+                "invocations": row.get("invocations", 0) or 0,
+                "preloads": row.get("preloads", 0) or 0,
+                "chained": row.get("chained", 0) or 0,
+                "installs": row.get("installs", 0) or 0,
+                "updates": row.get("updates", 0) or 0,
+                "deletes": row.get("deletes", 0) or 0,
+                "unique_sessions": row.get("unique_sessions", 0) or 0,
+                "last_used_at": row.get("last_used_at"),
+                "first_seen_at": row.get("first_seen_at"),
+            }
+        )
+
+    enriched.sort(
+        key=lambda s: (
+            -int((s.get("views", 0) or 0) + (s.get("invocations", 0) or 0) + (s.get("preloads", 0) or 0) + (s.get("chained", 0) or 0) + (s.get("installs", 0) or 0) + (s.get("updates", 0) or 0) + (s.get("deletes", 0) or 0)),
+            s["name"].lower(),
+        )
+    )
+    return {"period_days": days, "skills": enriched}
+
+
+@app.get("/api/skills/{skill_name}/stats")
+async def get_skill_detail(skill_name: str, days: int = 30):
+    from tools.skills_tool import _find_all_skills
+    from hermes_cli.skills_config import get_disabled_skills
+    from hermes_state import SessionDB
+
+    config = load_config()
+    disabled = get_disabled_skills(config)
+    inventory = {skill["name"]: skill for skill in _find_all_skills(skip_disabled=True)}
+    skill = inventory.get(skill_name)
+    if not skill:
+        raise HTTPException(status_code=404, detail="Skill not found")
+
+    db = SessionDB()
+    try:
+        detail = db.get_skill_detail(skill_name, days=days)
+    finally:
+        db.close()
+
+    detail["skill"] = {
+        **skill,
+        "enabled": skill_name not in disabled,
+    }
+    detail["period_days"] = days
+    return detail
+
+
+@app.get("/api/skills/cleanup")
+async def get_skill_cleanup(days: int = 30):
+    from tools.skills_tool import _find_all_skills
+    from hermes_cli.skills_config import get_disabled_skills
+    from hermes_state import SessionDB
+
+    config = load_config()
+    disabled = get_disabled_skills(config)
+    inventory = _find_all_skills(skip_disabled=True)
+    db = SessionDB()
+    try:
+        stats_rows = db.get_skill_stats(days=days)
+    finally:
+        db.close()
+
+    stats_by_name = {row["skill_name"]: row for row in stats_rows}
+    enriched = []
+    for skill in inventory:
+        row = stats_by_name.get(skill["name"], {})
+        enriched.append(
+            {
+                **skill,
+                "enabled": skill["name"] not in disabled,
+                "views": row.get("views", 0) or 0,
+                "invocations": row.get("invocations", 0) or 0,
+                "preloads": row.get("preloads", 0) or 0,
+                "chained": row.get("chained", 0) or 0,
+                "installs": row.get("installs", 0) or 0,
+                "updates": row.get("updates", 0) or 0,
+                "deletes": row.get("deletes", 0) or 0,
+                "unique_sessions": row.get("unique_sessions", 0) or 0,
+                "last_used_at": row.get("last_used_at"),
+            }
+        )
+
+    return _build_skill_cleanup_report(enriched, days)
+
+
+@app.post("/api/skills/backfill")
+async def post_skill_backfill(body: SkillBackfillRequest):
+    from hermes_state import SessionDB
+
+    if not body.run:
+        return {"success": False, "message": "Backfill skipped"}
+
+    db = SessionDB()
+    try:
+        return db.backfill_skill_events_from_messages()
+    finally:
+        db.close()
+
+
+@app.get("/api/analytics/skills")
+async def get_skill_analytics(days: int = 30):
+    from tools.skills_tool import _find_all_skills
+    from hermes_state import SessionDB
+
+    inventory = _find_all_skills(skip_disabled=True)
+    inventory_by_name = {skill["name"]: skill for skill in inventory}
+    db = SessionDB()
+    try:
+        analytics = db.get_skill_analytics(days=days)
+    finally:
+        db.close()
+
+    top_categories: Dict[str, Dict[str, Any]] = {}
+    for row in analytics.get("top_skills", []):
+        skill = inventory_by_name.get(row["skill_name"], {})
+        category = skill.get("category") or "uncategorized"
+        row["category"] = category
+        bucket = top_categories.setdefault(
+            category,
+            {"category": category, "events": 0, "unique_skills": set()},
+        )
+        events = int(
+            (row.get("views", 0) or 0)
+            + (row.get("invocations", 0) or 0)
+            + (row.get("preloads", 0) or 0)
+            + (row.get("chained", 0) or 0)
+            + (row.get("installs", 0) or 0)
+            + (row.get("updates", 0) or 0)
+            + (row.get("deletes", 0) or 0)
+        )
+        bucket["events"] += events
+        bucket["unique_skills"].add(row["skill_name"])
+
+    category_rows = [
+        {"category": category, "events": values["events"], "unique_skills": len(values["unique_skills"])}
+        for category, values in top_categories.items()
+    ]
+    category_rows.sort(key=lambda row: (-row["events"], row["category"]))
+
+    totals = analytics.get("totals", {})
+    totals["active_skill_count"] = totals.get("unique_skills_used", 0)
+    totals["installed_skill_count"] = len(inventory)
+    totals["unused_skill_count"] = max(len(inventory) - totals.get("unique_skills_used", 0), 0)
+
+    analytics["totals"] = totals
+    analytics["top_categories"] = category_rows[:10]
+    return analytics
 
 
 @app.get("/api/tools/toolsets")

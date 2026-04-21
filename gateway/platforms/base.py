@@ -679,6 +679,70 @@ class ProcessingOutcome(Enum):
 
 
 @dataclass
+class AttachmentRecord:
+    """Normalized attachment metadata carried alongside legacy media lists."""
+
+    path: str
+    filename: str = ""
+    media_type: str = ""
+    kind: str = "file"
+    source_url: Optional[str] = None
+    size_bytes: Optional[int] = None
+    summary: Optional[str] = None
+    artifact_path: Optional[str] = None
+
+
+def infer_attachment_kind(media_type: str = "", message_type: "MessageType | None" = None) -> str:
+    """Normalize attachment kind from MIME type and/or message type."""
+    media_type = (media_type or "").lower()
+    if media_type.startswith("image/"):
+        return "image"
+    if media_type.startswith("video/"):
+        return "video"
+    if media_type.startswith("audio/"):
+        return "voice" if message_type == MessageType.VOICE else "audio"
+    if media_type.startswith(("application/", "text/")):
+        return "document"
+
+    if message_type == MessageType.PHOTO:
+        return "image"
+    if message_type == MessageType.VIDEO:
+        return "video"
+    if message_type == MessageType.VOICE:
+        return "voice"
+    if message_type == MessageType.AUDIO:
+        return "audio"
+    if message_type == MessageType.DOCUMENT:
+        return "document"
+    return "file"
+
+
+def build_attachment_record(
+    path: str,
+    media_type: str = "",
+    *,
+    filename: Optional[str] = None,
+    message_type: "MessageType | None" = None,
+    source_url: Optional[str] = None,
+    size_bytes: Optional[int] = None,
+    summary: Optional[str] = None,
+    artifact_path: Optional[str] = None,
+) -> AttachmentRecord:
+    """Create a normalized attachment record from platform-specific metadata."""
+    resolved_filename = filename or os.path.basename(path) or "attachment"
+    return AttachmentRecord(
+        path=path,
+        filename=resolved_filename,
+        media_type=media_type or "",
+        kind=infer_attachment_kind(media_type, message_type),
+        source_url=source_url,
+        size_bytes=size_bytes,
+        summary=summary,
+        artifact_path=artifact_path,
+    )
+
+
+@dataclass
 class MessageEvent:
     """
     Incoming message from a platform.
@@ -709,6 +773,7 @@ class MessageEvent:
     # media_urls: local file paths (for vision tool access)
     media_urls: List[str] = field(default_factory=list)
     media_types: List[str] = field(default_factory=list)
+    attachments: List[AttachmentRecord] = field(default_factory=list)
     
     # Reply context
     reply_to_message_id: Optional[str] = None
@@ -728,6 +793,26 @@ class MessageEvent:
 
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)
+
+    def __post_init__(self) -> None:
+        # Structured attachments are the source of truth. Always derive legacy
+        # media_urls/media_types from them when present so mixed/partial inputs
+        # normalize to one consistent representation for existing gateway code.
+        if self.attachments:
+            self.media_urls = [att.path for att in self.attachments if att.path]
+            self.media_types = [att.media_type or "" for att in self.attachments if att.path]
+        elif self.media_urls:
+            self.attachments = [
+                build_attachment_record(
+                    path,
+                    self.media_types[i] if i < len(self.media_types) else "",
+                    message_type=self.message_type,
+                )
+                for i, path in enumerate(self.media_urls)
+                if path
+            ]
+            self.media_urls = [att.path for att in self.attachments if att.path]
+            self.media_types = [att.media_type or "" for att in self.attachments if att.path]
     
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""
@@ -793,6 +878,7 @@ def merge_pending_message_event(
         if existing_is_photo and incoming_is_photo:
             existing.media_urls.extend(event.media_urls)
             existing.media_types.extend(event.media_types)
+            existing.attachments.extend(event.attachments)
             if event.text:
                 existing.text = BasePlatformAdapter._merge_caption(existing.text, event.text)
             return
@@ -801,6 +887,7 @@ def merge_pending_message_event(
             if incoming_has_media:
                 existing.media_urls.extend(event.media_urls)
                 existing.media_types.extend(event.media_types)
+                existing.attachments.extend(event.attachments)
             if event.text:
                 if existing.text:
                     existing.text = BasePlatformAdapter._merge_caption(existing.text, event.text)
@@ -818,7 +905,6 @@ def merge_pending_message_event(
             if event.text:
                 existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
             return
-
     pending_messages[session_key] = event
 
 

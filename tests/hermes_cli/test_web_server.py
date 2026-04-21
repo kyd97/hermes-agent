@@ -295,6 +295,216 @@ class TestWebServerEndpoints:
         resp = unauth_client.get("/api/status")
         assert resp.status_code == 200
 
+    def test_get_skill_stats(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        monkeypatch.setattr(
+            "tools.skills_tool._find_all_skills",
+            lambda skip_disabled=True: [
+                {"name": "plan", "description": "Plan things", "category": "software-development"},
+                {"name": "unused", "description": "Unused skill", "category": None},
+            ],
+        )
+        monkeypatch.setattr(
+            web_server,
+            "load_config",
+            lambda: {"skills": {"disabled": ["unused"]}},
+        )
+
+        class _FakeDB:
+            def get_skill_stats(self, days=30):
+                return [
+                    {
+                        "skill_name": "plan",
+                        "views": 2,
+                        "invocations": 1,
+                        "preloads": 0,
+                        "chained": 0,
+                        "unique_sessions": 1,
+                        "last_used_at": 123.0,
+                        "first_seen_at": 122.0,
+                    }
+                ]
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr("hermes_state.SessionDB", lambda: _FakeDB())
+
+        resp = self.client.get("/api/skills/stats?days=30")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["period_days"] == 30
+        skills = {item["name"]: item for item in data["skills"]}
+        assert skills["plan"]["views"] == 2
+        assert skills["plan"]["enabled"] is True
+        assert skills["unused"]["views"] == 0
+        assert skills["unused"]["enabled"] is False
+
+    def test_get_skill_analytics(self, monkeypatch):
+        monkeypatch.setattr(
+            "tools.skills_tool._find_all_skills",
+            lambda skip_disabled=True: [
+                {"name": "plan", "description": "Plan things", "category": "software-development"},
+                {"name": "debug", "description": "Debug things", "category": "software-development"},
+            ],
+        )
+
+        class _FakeDB:
+            def get_skill_analytics(self, days=30):
+                return {
+                    "period_days": days,
+                    "daily": [],
+                    "top_skills": [
+                        {
+                            "skill_name": "plan",
+                            "views": 3,
+                            "invocations": 2,
+                            "preloads": 1,
+                            "chained": 0,
+                            "installs": 1,
+                            "updates": 0,
+                            "deletes": 0,
+                            "unique_sessions": 2,
+                            "last_used_at": 123.0,
+                            "first_seen_at": 100.0,
+                        },
+                        {
+                            "skill_name": "debug",
+                            "views": 1,
+                            "invocations": 0,
+                            "preloads": 0,
+                            "chained": 1,
+                            "installs": 0,
+                            "updates": 0,
+                            "deletes": 0,
+                            "unique_sessions": 1,
+                            "last_used_at": 124.0,
+                            "first_seen_at": 101.0,
+                        },
+                    ],
+                    "totals": {
+                        "total_events": 8,
+                        "total_views": 4,
+                        "total_invocations": 2,
+                        "total_preloads": 1,
+                        "total_chained": 1,
+                        "total_installs": 1,
+                        "total_updates": 0,
+                        "total_deletes": 0,
+                        "unique_skills_used": 2,
+                    },
+                }
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr("hermes_state.SessionDB", lambda: _FakeDB())
+
+        resp = self.client.get("/api/analytics/skills?days=7")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["period_days"] == 7
+        assert data["totals"]["installed_skill_count"] == 2
+        assert data["totals"]["unused_skill_count"] == 0
+        assert data["totals"]["total_installs"] == 1
+        assert data["top_skills"][0]["category"] == "software-development"
+        assert data["top_categories"][0]["events"] == 9
+
+    def test_get_skill_detail(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        monkeypatch.setattr(
+            "tools.skills_tool._find_all_skills",
+            lambda skip_disabled=True: [
+                {"name": "plan", "description": "Plan things", "category": "software-development"},
+            ],
+        )
+        monkeypatch.setattr(
+            web_server,
+            "load_config",
+            lambda: {"skills": {"disabled": []}},
+        )
+
+        class _FakeDB:
+            def get_skill_detail(self, skill_name, days=30):
+                return {
+                    "skill_name": skill_name,
+                    "summary": {
+                        "skill_name": skill_name,
+                        "views": 2,
+                        "invocations": 1,
+                        "preloads": 0,
+                        "chained": 0,
+                        "installs": 1,
+                        "updates": 0,
+                        "deletes": 0,
+                        "unique_sessions": 1,
+                        "last_used_at": 123.0,
+                        "first_seen_at": 100.0,
+                    },
+                    "daily": [{"day": "2026-04-21", "views": 2, "invocations": 1, "preloads": 0, "chained": 0, "installs": 1, "updates": 0, "deletes": 0}],
+                    "by_trigger": [{"trigger": "slash_command", "count": 1}],
+                    "recent_events": [{"timestamp": 123.0, "event_type": "invoked", "trigger": "slash_command"}],
+                }
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr("hermes_state.SessionDB", lambda: _FakeDB())
+
+        resp = self.client.get("/api/skills/plan/stats?days=30")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["skill"]["name"] == "plan"
+        assert data["summary"]["installs"] == 1
+        assert data["by_trigger"][0]["trigger"] == "slash_command"
+
+    def test_get_skill_cleanup(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        monkeypatch.setattr(
+            "tools.skills_tool._find_all_skills",
+            lambda skip_disabled=True: [
+                {"name": "plan", "description": "Plan feature roadmap and implementation details", "category": "software-development"},
+                {"name": "plan-writer", "description": "Plan implementation details and roadmap steps", "category": "software-development"},
+                {"name": "unused-skill", "description": "Unused description", "category": None},
+            ],
+        )
+        monkeypatch.setattr(web_server, "load_config", lambda: {"skills": {"disabled": ["unused-skill"]}})
+
+        class _FakeDB:
+            def get_skill_stats(self, days=30):
+                return [
+                    {"skill_name": "plan", "views": 3, "invocations": 1, "preloads": 0, "chained": 0, "installs": 0, "updates": 0, "deletes": 0, "unique_sessions": 1, "last_used_at": 123.0},
+                    {"skill_name": "plan-writer", "views": 2, "invocations": 0, "preloads": 0, "chained": 0, "installs": 0, "updates": 0, "deletes": 0, "unique_sessions": 1, "last_used_at": 122.0},
+                ]
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr("hermes_state.SessionDB", lambda: _FakeDB())
+        resp = self.client.get("/api/skills/cleanup?days=30")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["summary"]["dead_skill_count"] == 1
+        assert data["dead_skills"][0]["name"] == "unused-skill"
+        assert data["duplicate_candidates"]
+
+    def test_post_skill_backfill(self, monkeypatch):
+        class _FakeDB:
+            def backfill_skill_events_from_messages(self):
+                return {"success": True, "events_backfilled": 5, "sessions_scanned": 2}
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr("hermes_state.SessionDB", lambda: _FakeDB())
+        resp = self.client.post("/api/skills/backfill", json={"run": True})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["events_backfilled"] == 5
+
     def test_path_traversal_blocked(self):
         """Verify URL-encoded path traversal is blocked."""
         # %2e%2e = ..

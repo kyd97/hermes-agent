@@ -69,6 +69,7 @@ from gateway.platforms.base import (
     MessageType,
     ProcessingOutcome,
     SendResult,
+    build_attachment_record,
     cache_image_from_bytes,
     cache_audio_from_bytes,
     cache_video_from_bytes,
@@ -2482,6 +2483,7 @@ class TelegramAdapter(BasePlatformAdapter):
             if event.media_urls:
                 existing.media_urls.extend(event.media_urls)
                 existing.media_types.extend(event.media_types)
+                existing.attachments.extend(event.attachments)
 
         # Cancel any pending flush and restart the timer
         prior_task = self._pending_text_batch_tasks.get(key)
@@ -2559,6 +2561,7 @@ class TelegramAdapter(BasePlatformAdapter):
         else:
             existing.media_urls.extend(event.media_urls)
             existing.media_types.extend(event.media_types)
+            existing.attachments.extend(event.attachments)
             if event.text:
                 existing.text = self._merge_caption(existing.text, event.text)
 
@@ -2623,8 +2626,17 @@ class TelegramAdapter(BasePlatformAdapter):
                             break
                 # Save to local cache (for vision tool access)
                 cached_path = cache_image_from_bytes(bytes(image_bytes), ext=ext)
+                image_mime = "image/jpeg" if ext in (".jpg", ".jpeg") else f"image/{ext.lstrip('.')}"
                 event.media_urls = [cached_path]
-                event.media_types = [f"image/{ext.lstrip('.')}" ]
+                event.media_types = [image_mime]
+                event.attachments = [
+                    build_attachment_record(
+                        cached_path,
+                        image_mime,
+                        filename=os.path.basename(cached_path),
+                        message_type=MessageType.PHOTO,
+                    )
+                ]
                 logger.info("[Telegram] Cached user photo at %s", cached_path)
                 media_group_id = getattr(msg, "media_group_id", None)
                 if media_group_id:
@@ -2645,6 +2657,14 @@ class TelegramAdapter(BasePlatformAdapter):
                 cached_path = cache_audio_from_bytes(bytes(audio_bytes), ext=".ogg")
                 event.media_urls = [cached_path]
                 event.media_types = ["audio/ogg"]
+                event.attachments = [
+                    build_attachment_record(
+                        cached_path,
+                        "audio/ogg",
+                        filename=getattr(msg.voice, "file_unique_id", None) and f"{msg.voice.file_unique_id}.ogg" or os.path.basename(cached_path),
+                        message_type=MessageType.VOICE,
+                    )
+                ]
                 logger.info("[Telegram] Cached user voice at %s", cached_path)
             except Exception as e:
                 logger.warning("[Telegram] Failed to cache voice: %s", e, exc_info=True)
@@ -2653,8 +2673,17 @@ class TelegramAdapter(BasePlatformAdapter):
                 file_obj = await msg.audio.get_file()
                 audio_bytes = await file_obj.download_as_bytearray()
                 cached_path = cache_audio_from_bytes(bytes(audio_bytes), ext=".mp3")
+                audio_mime = "audio/mpeg"
                 event.media_urls = [cached_path]
-                event.media_types = ["audio/mp3"]
+                event.media_types = [audio_mime]
+                event.attachments = [
+                    build_attachment_record(
+                        cached_path,
+                        audio_mime,
+                        filename=getattr(msg.audio, "file_name", None) or os.path.basename(cached_path),
+                        message_type=MessageType.AUDIO,
+                    )
+                ]
                 logger.info("[Telegram] Cached user audio at %s", cached_path)
             except Exception as e:
                 logger.warning("[Telegram] Failed to cache audio: %s", e, exc_info=True)
@@ -2737,6 +2766,15 @@ class TelegramAdapter(BasePlatformAdapter):
                 mime_type = SUPPORTED_DOCUMENT_TYPES[ext]
                 event.media_urls = [cached_path]
                 event.media_types = [mime_type]
+                event.attachments = [
+                    build_attachment_record(
+                        cached_path,
+                        mime_type,
+                        filename=original_filename or f"document{ext}",
+                        message_type=MessageType.DOCUMENT,
+                        size_bytes=doc.file_size,
+                    )
+                ]
                 logger.info("[Telegram] Cached user document at %s", cached_path)
 
                 # For text files, inject content into event.text (capped at 100 KB)
@@ -2781,6 +2819,7 @@ class TelegramAdapter(BasePlatformAdapter):
         else:
             existing.media_urls.extend(event.media_urls)
             existing.media_types.extend(event.media_types)
+            existing.attachments.extend(event.attachments)
             if event.text:
                 existing.text = self._merge_caption(existing.text, event.text)
 

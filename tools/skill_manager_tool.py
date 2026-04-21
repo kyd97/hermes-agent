@@ -75,6 +75,8 @@ def _security_scan_skill(skill_dir: Path) -> Optional[str]:
 
 import yaml
 
+from agent.skill_utils import extract_related_skills
+
 
 # All skills live in ~/.hermes/skills/ (single source of truth)
 HERMES_HOME = get_hermes_home()
@@ -147,7 +149,7 @@ def _validate_category(category: Optional[str]) -> Optional[str]:
     return None
 
 
-def _validate_frontmatter(content: str) -> Optional[str]:
+def _validate_frontmatter(content: str, expected_name: Optional[str] = None) -> Optional[str]:
     """
     Validate that SKILL.md content has proper frontmatter with required fields.
     Returns error message or None if valid.
@@ -176,14 +178,54 @@ def _validate_frontmatter(content: str) -> Optional[str]:
         return "Frontmatter must include 'name' field."
     if "description" not in parsed:
         return "Frontmatter must include 'description' field."
-    if len(str(parsed["description"])) > MAX_DESCRIPTION_LENGTH:
+
+    frontmatter_name = str(parsed["name"]).strip()
+    name_error = _validate_name(frontmatter_name)
+    if name_error:
+        return name_error
+    if expected_name and frontmatter_name != expected_name:
+        return f"Frontmatter name '{frontmatter_name}' must match the skill name '{expected_name}'."
+
+    raw_description = parsed["description"]
+    if raw_description is None:
+        return "Frontmatter 'description' must not be empty."
+    description = str(raw_description).strip()
+    if not description:
+        return "Frontmatter 'description' must not be empty."
+    if len(description) > MAX_DESCRIPTION_LENGTH:
         return f"Description exceeds {MAX_DESCRIPTION_LENGTH} characters."
+
+    for related_skill in extract_related_skills(parsed):
+        related_error = _validate_name(related_skill)
+        if related_error:
+            return f"Invalid related skill name '{related_skill}'. Related skills must use canonical skill names."
 
     body = content[end_match.end() + 3:].strip()
     if not body:
         return "SKILL.md must have content after the frontmatter (instructions, procedures, etc.)."
 
     return None
+
+
+def _lint_skill_content(content: str) -> list[str]:
+    """Return non-fatal authoring warnings for SKILL.md content."""
+    warnings: list[str] = []
+    content_without_fences = re.sub(r"```.*?```", "", content, flags=re.DOTALL)
+
+    def _has_heading(heading: str) -> bool:
+        pattern = re.compile(rf"^##\s+{re.escape(heading)}\s*$", re.IGNORECASE | re.MULTILINE)
+        return bool(pattern.search(content_without_fences))
+
+    if not _has_heading("When to Use"):
+        warnings.append("Consider adding a '## When to Use' section with concrete trigger conditions.")
+    if not _has_heading("Verification"):
+        warnings.append("Consider adding a '## Verification' section so the agent can confirm success.")
+    if not _has_heading("Pitfalls"):
+        warnings.append("Consider adding a '## Pitfalls' section documenting failure modes or gotchas.")
+    if not (_has_heading("Procedure") or _has_heading("Quick Reference")):
+        warnings.append("Consider adding a '## Procedure' or '## Quick Reference' section with executable steps.")
+
+    return warnings
 
 
 def _validate_content_size(content: str, label: str = "SKILL.md") -> Optional[str]:
@@ -313,7 +355,7 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
         return {"success": False, "error": err}
 
     # Validate content
-    err = _validate_frontmatter(content)
+    err = _validate_frontmatter(content, expected_name=name)
     if err:
         return {"success": False, "error": err}
 
@@ -343,6 +385,7 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
         shutil.rmtree(skill_dir, ignore_errors=True)
         return {"success": False, "error": scan_error}
 
+    lint_warnings = _lint_skill_content(content)
     result = {
         "success": True,
         "message": f"Skill '{name}' created.",
@@ -355,12 +398,17 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
         "To add reference files, templates, or scripts, use "
         "skill_manage(action='write_file', name='{}', file_path='references/example.md', file_content='...')".format(name)
     )
+    result["lint_warnings"] = lint_warnings
     return result
 
 
 def _edit_skill(name: str, content: str) -> Dict[str, Any]:
     """Replace the SKILL.md of any existing skill (full rewrite)."""
-    err = _validate_frontmatter(content)
+    existing = _find_skill(name)
+    if not existing:
+        return {"success": False, "error": f"Skill '{name}' not found. Use skills_list() to see available skills."}
+
+    err = _validate_frontmatter(content, expected_name=name)
     if err:
         return {"success": False, "error": err}
 
@@ -374,7 +422,6 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
 
     if not _is_local_skill(existing["path"]):
         return {"success": False, "error": f"Skill '{name}' is in an external directory and cannot be modified. Copy it to your local skills directory first."}
-
     skill_md = existing["path"] / "SKILL.md"
     # Back up original content for rollback
     original_content = skill_md.read_text(encoding="utf-8") if skill_md.exists() else None
@@ -387,10 +434,12 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
             _atomic_write_text(skill_md, original_content)
         return {"success": False, "error": scan_error}
 
+    lint_warnings = _lint_skill_content(content)
     return {
         "success": True,
         "message": f"Skill '{name}' updated.",
         "path": str(existing["path"]),
+        "lint_warnings": lint_warnings,
     }
 
 
@@ -468,13 +517,15 @@ def _patch_skill(
         return {"success": False, "error": err}
 
     # If patching SKILL.md, validate frontmatter is still intact
+    lint_warnings: list[str] = []
     if not file_path:
-        err = _validate_frontmatter(new_content)
+        err = _validate_frontmatter(new_content, expected_name=name)
         if err:
             return {
                 "success": False,
                 "error": f"Patch would break SKILL.md structure: {err}",
             }
+        lint_warnings = _lint_skill_content(new_content)
 
     original_content = content  # for rollback
     _atomic_write_text(target, new_content)
@@ -485,10 +536,12 @@ def _patch_skill(
         _atomic_write_text(target, original_content)
         return {"success": False, "error": scan_error}
 
-    return {
+    result = {
         "success": True,
         "message": f"Patched {'SKILL.md' if not file_path else file_path} in skill '{name}' ({match_count} replacement{'s' if match_count > 1 else ''}).",
+        "lint_warnings": lint_warnings,
     }
+    return result
 
 
 def _delete_skill(name: str) -> Dict[str, Any]:
@@ -674,6 +727,32 @@ def skill_manage(
         try:
             from agent.prompt_builder import clear_skills_system_prompt_cache
             clear_skills_system_prompt_cache(clear_snapshot=True)
+        except Exception:
+            pass
+
+        try:
+            from agent.skill_analytics import log_skill_event
+
+            event_map = {
+                "create": "installed",
+                "edit": "updated",
+                "patch": "updated",
+                "delete": "deleted",
+                "write_file": "updated",
+                "remove_file": "updated",
+            }
+            event_type = event_map.get(action)
+            if event_type:
+                log_skill_event(
+                    skill_name=name,
+                    event_type=event_type,
+                    trigger="skill_manage",
+                    metadata={
+                        "action": action,
+                        "category": category,
+                        "file_path": file_path,
+                    },
+                )
         except Exception:
             pass
 

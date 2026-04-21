@@ -21,6 +21,12 @@ from typing import Dict, Any, Optional, Set
 
 from agent.prompt_builder import _scan_context_content
 
+_INSTRUCTION_PACK_DIRS = (
+    (".hermes", "instructions"),
+    ("HERMES.d",),
+)
+_INSTRUCTION_PACK_EXTENSIONS = {".md", ".mdc", ".txt"}
+
 logger = logging.getLogger(__name__)
 
 # Context files to look for in subdirectories, in priority order.
@@ -172,7 +178,22 @@ class SubdirectoryHintTracker:
         """Load hint files from a directory. Returns formatted text or None."""
         self._loaded_dirs.add(directory)
 
-        found_hints = []
+        sections = []
+        hint_section = self._load_single_hint_file(directory)
+        if hint_section:
+            sections.append(hint_section)
+        instruction_section = self._load_instruction_packs(directory)
+        if instruction_section:
+            sections.append(instruction_section)
+
+        if not sections:
+            return None
+
+        logger.debug("Loaded subdirectory hints from %s", directory)
+        return "\n\n".join(sections)
+
+    def _load_single_hint_file(self, directory: Path) -> Optional[str]:
+        """Load the first matching classic hint file from a directory."""
         for filename in _HINT_FILENAMES:
             hint_path = directory / filename
             try:
@@ -184,41 +205,70 @@ class SubdirectoryHintTracker:
                 content = hint_path.read_text(encoding="utf-8").strip()
                 if not content:
                     continue
-                # Same security scan as startup context loading
                 content = _scan_context_content(content, filename)
                 if len(content) > _MAX_HINT_CHARS:
                     content = (
                         content[:_MAX_HINT_CHARS]
                         + f"\n\n[...truncated {filename}: {len(content):,} chars total]"
                     )
-                # Best-effort relative path for display
-                rel_path = str(hint_path)
-                try:
-                    rel_path = str(hint_path.relative_to(self.working_dir))
-                except ValueError:
-                    try:
-                        rel_path = str(hint_path.relative_to(Path.home()))
-                        rel_path = "~/" + rel_path
-                    except ValueError:
-                        pass  # keep absolute
-                found_hints.append((rel_path, content))
-                # First match wins per directory (like startup loading)
-                break
+                rel_path = self._display_path(hint_path)
+                return f"[Subdirectory context discovered: {rel_path}]\n{content}"
             except Exception as exc:
                 logger.debug("Could not read %s: %s", hint_path, exc)
+        return None
 
-        if not found_hints:
+    def _load_instruction_packs(self, directory: Path) -> Optional[str]:
+        """Load modular instruction packs from a visited directory."""
+        rendered_packs = []
+        for pack_dir_parts in _INSTRUCTION_PACK_DIRS:
+            pack_dir = directory.joinpath(*pack_dir_parts)
+            try:
+                if not pack_dir.is_dir():
+                    continue
+            except OSError:
+                continue
+            try:
+                pack_files = sorted(
+                    [
+                        child for child in pack_dir.iterdir()
+                        if child.is_file() and child.suffix.lower() in _INSTRUCTION_PACK_EXTENSIONS
+                    ],
+                    key=lambda p: p.name,
+                )
+            except Exception as exc:
+                logger.debug("Could not read instruction packs in %s: %s", pack_dir, exc)
+                continue
+
+            for pack_file in pack_files:
+                try:
+                    content = pack_file.read_text(encoding="utf-8").strip()
+                    if not content:
+                        continue
+                    rel_path = self._display_path(pack_file)
+                    content = _scan_context_content(content, rel_path)
+                    rendered = f"### {rel_path}\n{content}"
+                    if len(rendered) > _MAX_HINT_CHARS:
+                        rendered = (
+                            rendered[:_MAX_HINT_CHARS]
+                            + f"\n\n[...truncated {pack_file.name}: {len(rendered):,} chars total]"
+                        )
+                    rendered_packs.append(rendered)
+                except Exception as exc:
+                    logger.debug("Could not read instruction pack %s: %s", pack_file, exc)
+
+        if not rendered_packs:
             return None
+        return "[Subdirectory context discovered: Project instruction packs]\n" + "\n\n".join(rendered_packs)
 
-        sections = []
-        for rel_path, content in found_hints:
-            sections.append(
-                f"[Subdirectory context discovered: {rel_path}]\n{content}"
-            )
-
-        logger.debug(
-            "Loaded subdirectory hints from %s: %s",
-            directory,
-            [h[0] for h in found_hints],
-        )
-        return "\n\n".join(sections)
+    def _display_path(self, path: Path) -> str:
+        """Best-effort relative path for display."""
+        rel_path = str(path)
+        try:
+            rel_path = str(path.relative_to(self.working_dir))
+        except ValueError:
+            try:
+                rel_path = str(path.relative_to(Path.home()))
+                rel_path = "~/" + rel_path
+            except ValueError:
+                pass
+        return rel_path
