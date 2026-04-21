@@ -47,13 +47,17 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# Backward-compat alias for older tests/callers that monkeypatch MEMORY_DIR.
+# When left untouched, get_memory_dir() still resolves dynamically from the
+# active HERMES_HOME profile.
+MEMORY_DIR: Path | None = None
+
 # Where memory files live — resolved dynamically so profile overrides
-# (HERMES_HOME env var changes) are always respected.  The old module-level
-# constant was cached at import time and could go stale if a profile switch
-# happened after the first import.
+# (HERMES_HOME env var changes) are always respected unless a test explicitly
+# monkeypatches MEMORY_DIR for isolation.
 def get_memory_dir() -> Path:
     """Return the profile-scoped memories directory."""
-    return get_hermes_home() / "memories"
+    return MEMORY_DIR or (get_hermes_home() / "memories")
 
 ENTRY_DELIMITER = "\n§\n"
 DEFAULT_MEMORY_CLASS = "other"

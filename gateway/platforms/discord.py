@@ -17,10 +17,18 @@ import subprocess
 import tempfile
 import threading
 import time
+import traceback
 from collections import defaultdict
-from typing import Callable, Dict, Optional, Any
+from typing import Any, Callable, Dict, Optional
+from urllib.parse import urlparse
+
 
 logger = logging.getLogger(__name__)
+
+_TRUSTED_DISCORD_ATTACHMENT_HOSTS = {
+    "cdn.discordapp.com",
+    "media.discordapp.net",
+}
 
 VALID_THREAD_AUTO_ARCHIVE_MINUTES = {60, 1440, 4320, 10080}
 
@@ -2921,7 +2929,8 @@ class DiscordAdapter(BasePlatformAdapter):
             return raw_bytes
 
         # Fallback: SSRF-gated URL download.
-        if not is_safe_url(att.url):
+        host = (urlparse(att.url).hostname or "").lower()
+        if host not in _TRUSTED_DISCORD_ATTACHMENT_HOSTS and not is_safe_url(att.url):
             raise ValueError(
                 f"Blocked unsafe attachment URL (SSRF protection): {att.url}"
             )

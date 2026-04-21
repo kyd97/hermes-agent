@@ -953,7 +953,7 @@ class TestOnMemoryWriteBridge:
         mgr.add_provider(p)
 
         mgr.on_memory_write("add", "memory", "new fact")
-        assert p.memory_writes == [("add", "memory", "new fact")]
+        assert p.memory_writes == [("add", "memory", "new fact", {})]
 
     def test_on_memory_write_replace(self):
         """on_memory_write fires for 'replace' actions."""
@@ -962,7 +962,7 @@ class TestOnMemoryWriteBridge:
         mgr.add_provider(p)
 
         mgr.on_memory_write("replace", "user", "updated pref")
-        assert p.memory_writes == [("replace", "user", "updated pref")]
+        assert p.memory_writes == [("replace", "user", "updated pref", {})]
 
     def test_on_memory_write_remove_not_bridged(self):
         """The bridge intentionally skips 'remove' — only add/replace notify."""
@@ -975,7 +975,7 @@ class TestOnMemoryWriteBridge:
         # Manager itself doesn't filter — run_agent.py does.
         # But providers should handle remove gracefully.
         mgr.on_memory_write("remove", "memory", "old fact")
-        assert p.memory_writes == [("remove", "memory", "old fact")]
+        assert p.memory_writes == [("remove", "memory", "old fact", {})]
 
     def test_memory_manager_tool_injection_deduplicates(self):
         """Memory manager tools already in self.tools (from plugin registry)
@@ -1031,7 +1031,7 @@ class TestOnMemoryWriteBridge:
 
         mgr.on_memory_write("add", "user", "test")
         # Good provider still received the call despite bad provider crashing
-        assert good.memory_writes == [("add", "user", "test")]
+        assert good.memory_writes == [("add", "user", "test", {})]
 
 
 class TestHonchoCadenceTracking:
